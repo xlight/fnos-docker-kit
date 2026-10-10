@@ -1,0 +1,75 @@
+# fnos-docker-mode compose（与 fnos_deploy_docker.sh 等效声明式）
+#
+# 用法：
+#   sudo docker compose -f fnos_docker_compose.yml up -d
+#
+# 安全：cap 白名单，绝不用 privileged。存储 via devices 透传专属块设备。
+# 端口：宿主 15667 -> 容器 5666（避开 LXC CT200 的 5666）。
+# fnOS 内置 Docker（docker/dockermgr/dsmgr）：deploy 脚本默认停用（.bak）；
+# compose 方式需进容器手动执行同等操作：
+#   for s in docker dockermgr dsmgr; do
+#     systemctl disable --now $s.service
+#     [ -f /etc/systemd/system/$s.service ] && mv /etc/systemd/system/$s.service /etc/systemd/system/$s.service.bak
+#   done; systemctl daemon-reload
+#
+# trim_nginx 超时豁免（消除 systemd 默认 90s 杀-重启循环）：deploy 脚本首启前写入；
+# compose 方式在"创建后、启动前"手动写入：
+#   mkdir -p trim_nginx.service.d && printf '[Service]\nTimeoutStartSec=900\n' > trim_nginx.service.d/timeout.conf
+#   docker compose create
+#   docker cp trim_nginx.service.d <容器名>:/etc/systemd/system/
+#   docker compose start
+# 验证：systemctl show trim_nginx -p TimeoutStartUSec -> 15min；NRestarts -> 0
+services:
+  fnos-dockermode:
+    image: fnos-dockermode:1.2.0701-fix
+    container_name: fnos-dm-test
+    hostname: fnos-docker
+    entrypoint: /lib/systemd/systemd
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /tmp
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # /sys/block 掩码（stor-mask-docker.sh apply 生成；可见性==透传集合）
+      - /var/lib/fnos-docker-mask/fnos-dm-test/sysblock:/sys/block
+      # 写热点 volume（bypass overlay copy-up；pgdata/logs/www 默认启用）
+      - fnos-pgdata:/var/lib/postgresql/15/main
+      - fnos-logs:/var/log
+      # www 卷用 nocopy（跳过 Docker 卷首填的冗余拷贝；fnOS boot 路径自会 wipe+refill）
+      - type: volume
+        source: fnos-www
+        target: /usr/trim/www
+        volume:
+          nocopy: true
+    # 存储透传：专属块设备（示例为测试 zvol；生产用 nvmet 导出的 nvme 设备）
+    devices:
+      - /dev/zd144
+    ports:
+      - "15667:5666"
+    cgroup: host
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+      - NET_ADMIN
+      - NET_BROADCAST
+      - NET_RAW
+      - MKNOD
+      - AUDIT_WRITE
+      - SETUID
+      - SETGID
+      - DAC_READ_SEARCH
+      - SYS_RESOURCE
+      - IPC_LOCK
+      - KILL
+      - CHOWN
+      - FOWNER
+      - SETFCAP
+      - LINUX_IMMUTABLE
+
+volumes:
+  fnos-pgdata:
+  fnos-logs:
+  fnos-www:

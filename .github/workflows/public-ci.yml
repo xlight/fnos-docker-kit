@@ -1,0 +1,123 @@
+# 公开 CI 自检（无需 PVE；GitHub-hosted runner）
+# 设计来源：fnos-public-release-split D5（自检）+ D7（release automation 落点）。
+# 触发：
+#   - workflow_dispatch（手动，可指定 iso_url / version）
+#   - schedule：每天一次（版本监控种子；见任务 5.3）
+# 行为：
+#   - 下载官方 ISO → extract → aobpatch check → patch apply → mkraw → fsck
+#   - check/apply 失败 → 显式失败 + 上传 patch-report.json（可读报告；开 Issue 由 5.3/人工接）
+#   - 成功且为版本 tag 触发 → 打包补丁集 Release（任务 4.2）
+name: public-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: "官方 ISO 直链（默认用 LATEST_ISO）"
+        required: false
+        default: ""
+      version:
+        description: "fnOS 版本（如 V1.2.0701，决定补丁集）"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 2 * * *"
+
+env:
+  LATEST_ISO: "https://iso.liveupdate.fnnas.com/x86/iso/fnos_Mainland-PE_x86_1.2.0701_2727.iso"
+  LATEST_VERSION: "V1.2.0701"
+
+jobs:
+  selfcheck:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 磁盘断言（物料峰值约 20G）
+        run: |
+          avail=$(df --output=avail -BG "$RUNNER_TEMP" | tail -1 | tr -dc 0-9)
+          echo "可用磁盘: ${avail}G"
+          [ "$avail" -ge 25 ] || { echo "磁盘不足，中止"; exit 1; }
+
+      - name: 下载官方 ISO
+        run: |
+          url="${{ inputs.iso_url }}"; [ -n "$url" ] || url="$LATEST_ISO"
+          echo "ISO_URL=$url" >> "$GITHUB_ENV"
+          curl -fL --retry 3 -o /tmp/fnos.iso "$url"
+          ls -la /tmp/fnos.iso
+
+      - name: extract 出厂 rootfs
+        run: |
+          sudo python3 fnos/toolchain/fnos_iso.py extract /tmp/fnos.iso "$RUNNER_TEMP/factory"
+          rm -f /tmp/fnos.iso
+
+      - name: aobpatch check（失败即停，不写半成品）
+        id: check
+        run: |
+          ver="${{ inputs.version }}"; [ -n "$ver" ] || ver="$LATEST_VERSION"
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          sudo python3 fnos/toolchain/aobpatch.py check \
+            --rootfs "$RUNNER_TEMP/factory" \
+            --patchset "fnos/toolchain/patches/fnos-${ver#V}.json" \
+            --report "$RUNNER_TEMP/patch-report.json"
+          cat "$RUNNER_TEMP/patch-report.json"
+
+      - name: patch apply + mkraw + fsck
+        if: steps.check.outcome == 'success'
+        run: |
+          sudo python3 fnos/toolchain/fnos_patch.py apply --rootfs "$RUNNER_TEMP/factory"
+          sudo python3 fnos/toolchain/fnos_image.py mkraw "$RUNNER_TEMP/factory" "$RUNNER_TEMP/image.raw" 12 --fs=ext4
+          sudo python3 fnos/toolchain/fnos_image.py check "$RUNNER_TEMP/image.raw" \
+            --patchset "fnos/toolchain/patches/fnos-${VERSION#V}.json"
+          rm -rf "$RUNNER_TEMP/factory"
+
+      - name: 上传可读报告（含失败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-report-${{ env.VERSION }}
+          path: ${{ runner.temp }}/patch-report.json
+          if-no-files-found: warn
+
+  open-issue:
+    needs: selfcheck
+    if: failure()
+    runs-on: ubuntu-22.04
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: patch-report-${{ env.VERSION }}
+          path: /tmp/report
+      - name: 补丁失效开 Issue（含 per-site 报告）
+        run: |
+          body=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/report/patch-report.json'))
+          items = d.get('items') or d.get('patches') or []
+          bad = [i for i in items if str(i.get('status','')) not in ('already','ready','applied','ok')]
+          lines = ['patchset missed on new ISO: %d/%d ok.' % (len(items)-len(bad), len(items)), '']
+          lines += ['- %s -> %s' % (i.get('id'), i.get('status')) for i in bad]
+          print('\n'.join(lines))
+          ")
+          gh issue create --title "patchset miss ${VERSION} $(date -u +%F)" --body "$body"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    needs: selfcheck
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: 发布补丁集到 Release
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          gh release create "v$ver" \
+            "fnos/toolchain/patches/fnos-$ver.json" \
+            --title "patchset $ver" --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
