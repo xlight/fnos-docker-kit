@@ -121,14 +121,35 @@ jobs:
           ls "toolchain/patches/fnos-${VERSION#V}.json" \
             || { echo "无该版本补丁集，需人工 rebase"; exit 1; }
 
-      - name: 下载官方 ISO（含官网 hash 校验）
+      - name: 恢复 ISO 缓存（按版本 key；命中则跳过下载）
+        id: iso-cache
+        if: needs.detect.outputs.version != 'manual'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fnos.iso
+          key: fnos-iso-${{ needs.detect.outputs.version }}
+          restore-keys: fnos-iso-
+
+      - name: 下载官方 ISO（含官网 hash 校验，坏缓存当场重下）
         run: |
-          curl -fL --retry 3 -o /tmp/fnos.iso "${{ needs.detect.outputs.iso_url }}"
-          ls -la /tmp/fnos.iso
+          if [ "${{ steps.iso-cache.outputs.cache-hit }}" != "true" ]; then
+            curl -fL --retry 3 -o /tmp/fnos.iso.downloading "${{ needs.detect.outputs.iso_url }}"
+            mv /tmp/fnos.iso.downloading /tmp/fnos.iso
+            ls -la /tmp/fnos.iso
+          else
+            echo "命中 ISO 缓存，跳过下载"
+          fi
           want="${{ needs.detect.outputs.iso_hash }}"
-          if [ -n "$want" ]; then
+          if [ -n "$want" ] && [ "$want" != "manual" ]; then
             got=$(sha256sum /tmp/fnos.iso | awk '{print $1}')
-            [ "$got" = "$want" ] || { echo "ISO hash 不符: want=$want got=$got"; exit 1; }
+            if [ "$got" != "$want" ]; then
+              echo "ISO hash 不符（坏缓存？）：want=$want got=$got，重下一次"
+              rm -f /tmp/fnos.iso
+              curl -fL --retry 3 -o /tmp/fnos.iso.downloading "${{ needs.detect.outputs.iso_url }}"
+              mv /tmp/fnos.iso.downloading /tmp/fnos.iso
+              got=$(sha256sum /tmp/fnos.iso | awk '{print $1}')
+              [ "$got" = "$want" ] || { echo "重下仍不一致，中止"; exit 1; }
+            fi
             echo "ISO hash 一致"
           fi
 
