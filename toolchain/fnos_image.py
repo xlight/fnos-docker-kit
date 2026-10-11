@@ -16,6 +16,7 @@
 # ============================================================================
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -119,18 +120,19 @@ def check(image, patchset=None):
         res = {"kind": "vztmpl", "entries": len(names), "missing_key_files": missing, "kernel": boot}
         res["ok"] = bool(not missing and boot)
         return res
-    # ZFS 数据集？（PVE zfspool rootfs 形态）
-    z = subprocess.run(["zfs", "list", "-H", "-o", "name", image],
-                       capture_output=True, text=True)
-    if z.returncode == 0 and z.stdout.strip() == image:
-        mp = _out(["zfs", "get", "-H", "-o", "value", "mountpoint", image])
-        missing = [k for k in KEY_FILES if not os.path.exists(os.path.join(mp, k))]
-        boot = _out(["sh", "-c", "ls %s/boot/vmlinuz-* 2>/dev/null | head -1" % mp])
-        patches = _patch_check(mp, patchset) if patchset else None
-        res = {"kind": "zfs", "dataset": image, "mountpoint": mp,
-               "missing_key_files": missing, "kernel": boot, "patches": patches}
-        res["ok"] = bool(not missing and boot and (patches is None or patches.get("ok")))
-        return res
+    # ZFS 数据集？（PVE zfspool rootfs 形态；无 zfs 命令时跳过该分支）
+    if shutil.which("zfs"):
+        z = subprocess.run(["zfs", "list", "-H", "-o", "name", image],
+                           capture_output=True, text=True)
+        if z.returncode == 0 and z.stdout.strip() == image:
+            mp = _out(["zfs", "get", "-H", "-o", "value", "mountpoint", image])
+            missing = [k for k in KEY_FILES if not os.path.exists(os.path.join(mp, k))]
+            boot = _out(["sh", "-c", "ls %s/boot/vmlinuz-* 2>/dev/null | head -1" % mp])
+            patches = _patch_check(mp, patchset) if patchset else None
+            res = {"kind": "zfs", "dataset": image, "mountpoint": mp,
+                   "missing_key_files": missing, "kernel": boot, "patches": patches}
+            res["ok"] = bool(not missing and boot and (patches is None or patches.get("ok")))
+            return res
     fstype = _out(["blkid", "-o", "value", "-s", "TYPE", image])
     fsck = _fsck(image, fstype)
     mnt = tempfile.mkdtemp(prefix="fnos-chk-")
