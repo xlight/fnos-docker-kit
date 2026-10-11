@@ -1,35 +1,98 @@
-# 公开 CI 自检（无需 PVE；GitHub-hosted runner）
+# 公开 CI 自检 + 自动发布（无需 PVE；GitHub-hosted runner）
 # 设计来源：fnos-public-release-split D5（自检）+ D7（release automation 落点）。
 # 触发：
-#   - workflow_dispatch（手动，可指定 iso_url / version）
-#   - schedule：每天一次（版本监控种子；见任务 5.3）
-# 行为：
-#   - 下载官方 ISO → extract → aobpatch check → patch apply → mkraw → fsck
-#   - check/apply 失败 → 显式失败 + 上传 patch-report.json（可读报告；开 Issue 由 5.3/人工接）
-#   - 成功且为版本 tag 触发 → 打包补丁集 Release（任务 4.2）
+#   - workflow_dispatch（手动；可指定 iso_url / version 跳过自动检测）
+#   - schedule：每天一次（版本监控）
+# 流程：
+#   detect（check-iso-update.py）→ 查 Hub tag 去重 → 下载 → 自检构建 →
+#   成功推镜像（版本 tag + latest）/ 失败按原因开不同 Issue
+# 状态机（检测器 rc）：0=无变化；10=有新版且可下载；11=有新版但下载被拦；2=检测故障
 name: public-ci
 
 on:
   workflow_dispatch:
     inputs:
       iso_url:
-        description: "官方 ISO 直链（默认用 LATEST_ISO）"
+        description: "官方 ISO 直链（留空则自动检测）"
         required: false
         default: ""
       version:
-        description: "fnOS 版本（如 V1.2.0701，决定补丁集）"
+        description: "fnOS 版本（如 1.2.0701，留空则自动检测）"
         required: false
         default: ""
   schedule:
     - cron: "0 2 * * *"
 
 env:
-  LATEST_ISO: "https://iso.liveupdate.fnnas.com/x86/iso/fnos_Mainland-PE_x86_1.2.0701_2727.iso"
-  LATEST_VERSION: "V1.2.0701"
+  DOCKERHUB_REPO: "xlight/fnos-dockermode"
 
 jobs:
-  selfcheck:
+  detect:
     runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      iso_url: ${{ steps.detect.outputs.iso_url }}
+      iso_hash: ${{ steps.detect.outputs.iso_hash }}
+      descent: ${{ steps.detect.outputs.descent }}
+      build: ${{ steps.gate.outputs.build }}
+      downloadable: ${{ steps.probe.outputs.downloadable }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 自动检测（手动输入优先）
+        id: detect
+        run: |
+          if [ -n "${{ inputs.iso_url }}" ]; then
+            ver="${{ inputs.version }}"; [ -n "$ver" ] || ver="manual"
+            echo "version=$ver" >> "$GITHUB_OUTPUT"
+            echo "iso_url=${{ inputs.iso_url }}" >> "$GITHUB_OUTPUT"
+            echo "iso_hash=" >> "$GITHUB_OUTPUT"
+            echo "descent=manual" >> "$GITHUB_OUTPUT"
+          else
+            out=$(python3 toolchain/check-iso-update.py --no-probe); rc=$?
+            # rc=0 无变化（仍继续：幂等复验当前版）；rc=2 检测故障
+            if [ "$rc" = "2" ]; then echo "$out"; exit 1; fi
+            ver=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['version'])")
+            url=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['url'])")
+            hsh=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['hash'])")
+            echo "version=$ver" >> "$GITHUB_OUTPUT"
+            echo "iso_url=$url" >> "$GITHUB_OUTPUT"
+            echo "iso_hash=$hsh" >> "$GITHUB_OUTPUT"
+            echo "descent=auto" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 查 Hub 是否已发布该版本（天然去重）
+        id: gate
+        run: |
+          ver="${{ steps.detect.outputs.version }}"
+          if [ "$ver" = "manual" ]; then echo "build=yes" >> "$GITHUB_OUTPUT"; exit 0; fi
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/$ver")
+          if [ "$code" = "200" ]; then
+            echo "Hub 已有 $ver，跳过构建"
+            echo "build=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 探测直链可下载性
+        id: probe
+        if: steps.gate.outputs.build == 'yes'
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            -r 0-1023 "${{ steps.detect.outputs.iso_url }}")
+          if [ "$code" = "200" ] || [ "$code" = "206" ]; then
+            echo "downloadable=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "downloadable=no (http=$code)" >> "$GITHUB_OUTPUT"
+          fi
+
+  selfcheck:
+    needs: detect
+    if: needs.detect.outputs.build == 'yes' && needs.detect.outputs.downloadable != 'no'
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,11 +102,14 @@ jobs:
           echo "可用磁盘: ${avail}G"
           [ "$avail" -ge 25 ] || { echo "磁盘不足，中止"; exit 1; }
 
-      - name: 下载官方 ISO
+      - name: 补丁集存在性（缺失=需 rebase，直接失败）
         run: |
-          url="${{ inputs.iso_url }}"; [ -n "$url" ] || url="$LATEST_ISO"
-          echo "ISO_URL=$url" >> "$GITHUB_ENV"
-          curl -fL --retry 3 -o /tmp/fnos.iso "$url"
+          ls "toolchain/patches/fnos-${VERSION#V}.json" \
+            || { echo "无该版本补丁集，需人工 rebase"; exit 1; }
+
+      - name: 下载官方 ISO（含官网 hash 校验）
+        run: |
+          curl -fL --retry 3 -o /tmp/fnos.iso "${{ needs.detect.outputs.iso_url }}"
           ls -la /tmp/fnos.iso
 
       - name: extract 出厂 rootfs
@@ -54,8 +120,7 @@ jobs:
       - name: aobpatch check（失败即停，不写半成品）
         id: check
         run: |
-          ver="${{ inputs.version }}"; [ -n "$ver" ] || ver="$LATEST_VERSION"
-          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          ver="$VERSION"
           sudo python3 toolchain/aobpatch.py check \
             --rootfs "$RUNNER_TEMP/factory" \
             --patchset "toolchain/patches/fnos-${ver#V}.json" \
@@ -68,8 +133,25 @@ jobs:
           sudo python3 toolchain/fnos_patch.py apply --rootfs "$RUNNER_TEMP/factory"
           sudo python3 toolchain/fnos_image.py mkraw "$RUNNER_TEMP/factory" "$RUNNER_TEMP/image.raw" 12 --fs=ext4
           sudo python3 toolchain/fnos_image.py check "$RUNNER_TEMP/image.raw" \
-            --patchset "toolchain/patches/fnos-${VERSION#V}.json"
-          rm -rf "$RUNNER_TEMP/factory"
+            --patchset="toolchain/patches/fnos-${VERSION#V}.json"
+
+      - name: docker import + 双标签推送
+        if: steps.check.outcome == 'success'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
+          ver="$VERSION"
+          # 容器运行必需（fnos_patch 不管这两项）：有效 machine-id + /run 骨架
+          [ -s "$RUNNER_TEMP/factory/etc/machine-id" ] || \
+            python3 -c "import uuid; print(uuid.uuid4().hex)" | sudo tee "$RUNNER_TEMP/factory/etc/machine-id" >/dev/null
+          sudo mkdir -p "$RUNNER_TEMP/factory/run/systemd/system"
+          sudo tar -C "$RUNNER_TEMP/factory" -c --exclude=proc --exclude=sys --exclude=dev . | docker import \
+            --change 'ENTRYPOINT ["/lib/systemd/systemd"]' \
+            --change 'ENV container=docker' \
+            --change 'CMD ["log-level=info"]' \
+            - "${DOCKERHUB_REPO}:$ver"
+          docker tag "${DOCKERHUB_REPO}:$ver" "${DOCKERHUB_REPO}:latest"
+          docker push "${DOCKERHUB_REPO}:$ver"
+          docker push "${DOCKERHUB_REPO}:latest"
 
       - name: 上传可读报告（含失败）
         if: always()
@@ -80,15 +162,15 @@ jobs:
           if-no-files-found: warn
 
   open-issue:
-    needs: selfcheck
-    if: failure()
+    needs: [detect, selfcheck]
+    if: failure() && needs.selfcheck.result == 'failure'
     runs-on: ubuntu-22.04
     permissions:
       issues: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: patch-report-${{ env.VERSION }}
+          name: patch-report-${{ needs.detect.outputs.version }}
           path: /tmp/report
       - name: 补丁失效开 Issue（含 per-site 报告）
         run: |
@@ -101,7 +183,35 @@ jobs:
           lines += ['- %s -> %s' % (i.get('id'), i.get('status')) for i in bad]
           print('\n'.join(lines))
           ")
-          gh issue create --title "patchset miss ${VERSION} $(date -u +%F)" --body "$body"
+          gh issue create --title "patchset miss ${{ needs.detect.outputs.version }} $(date -u +%F)" --body "$body"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  blocked-issue:
+    needs: detect
+    if: needs.detect.outputs.build == 'yes' && needs.detect.outputs.downloadable == 'no'
+    runs-on: ubuntu-22.04
+    permissions:
+      issues: write
+    steps:
+      - name: 直链被拦开 Issue
+        run: |
+          gh issue create --title "ISO download blocked ${{ needs.detect.outputs.version }} $(date -u +%F)" \
+            --body "新版 ${{ needs.detect.outputs.version }} 已发现，但直链下载被拦截（CDN 403）。需人工提供可用的 ISO 来源后手动触发构建。"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  detect-issue:
+    needs: detect
+    if: failure() && needs.detect.result == 'failure'
+    runs-on: ubuntu-22.04
+    permissions:
+      issues: write
+    steps:
+      - name: 检测故障开 Issue
+        run: |
+          gh issue create --title "ISO detector failed $(date -u +%F)" \
+            --body "版本检测器抓取/解析失败（非'无新版'）。请检查官网下载页结构是否变更。"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

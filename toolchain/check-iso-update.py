@@ -92,6 +92,8 @@ def main():
         open(state_file, "w").write(cur["version"] + "\n")
     if not out["changed"]:
         return 0
+    if not do_probe:
+        return 10  # --no-probe 仅用于本地调试：不断言可下载性，调用方自理
     return 10 if out.get("downloadable") else 11
 
 
