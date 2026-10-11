@@ -141,13 +141,18 @@ jobs:
           fi
           want="${{ needs.detect.outputs.iso_hash }}"
           if [ -n "$want" ] && [ "$want" != "manual" ]; then
-            got=$(sha256sum /tmp/fnos.iso | awk '{print $1}')
+            # 官网 hash 为 MD5(32 位)，否则按 SHA256 比对
+            hash_of() {
+              if [ "${#1}" = "32" ]; then md5sum "$2" | awk '{print $1}';
+              else sha256sum "$2" | awk '{print $1}'; fi
+            }
+            got=$(hash_of "$want" /tmp/fnos.iso)
             if [ "$got" != "$want" ]; then
               echo "ISO hash 不符（坏缓存？）：want=$want got=$got，重下一次"
               rm -f /tmp/fnos.iso
               curl -fL --retry 3 -o /tmp/fnos.iso.downloading "${{ needs.detect.outputs.iso_url }}"
               mv /tmp/fnos.iso.downloading /tmp/fnos.iso
-              got=$(sha256sum /tmp/fnos.iso | awk '{print $1}')
+              got=$(hash_of "$want" /tmp/fnos.iso)
               [ "$got" = "$want" ] || { echo "重下仍不一致，中止"; exit 1; }
             fi
             echo "ISO hash 一致"
