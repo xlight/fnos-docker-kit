@@ -1,0 +1,669 @@
+{
+  "fnos_version": "V1.2.0701",
+  "derived_from_table": "private-table:V1.2.0701",
+  "patches": [
+    {
+      "id": "filemanager.29c7->9090#0",
+      "file": "usr/trim/bin/filemanager",
+      "match": "?? ?? ?? 29 c7 e8 a3 b2",
+      "replace": [
+        {
+          "find": "29c7",
+          "to": "9090"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.29c7->9090#1",
+      "file": "usr/trim/bin/filemanager",
+      "match": "02 00 00 29 c7 e8 37 b2",
+      "replace": [
+        {
+          "find": "29c7",
+          "to": "9090"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.29c7->9090#2",
+      "file": "usr/trim/bin/filemanager",
+      "match": "?? ?? ?? 29 c7 e8 1a 22",
+      "replace": [
+        {
+          "find": "29c7",
+          "to": "9090"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#3",
+      "file": "usr/trim/bin/filemanager",
+      "match": "b6 d3 bf 2b e4 ff ff 48",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#4",
+      "file": "usr/trim/bin/filemanager",
+      "match": "31 d2 bf 2b e4 ff ff e8",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#5",
+      "file": "usr/trim/bin/filemanager",
+      "match": "89 e5 bf 2b e4 ff ff 48",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#6",
+      "file": "usr/trim/bin/filemanager",
+      "match": "48 89 ee bf 2b e4 ff ff e8 91",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#7",
+      "file": "usr/trim/bin/filemanager",
+      "match": "4c 89 e6 bf 2b e4 ff ff e8 71",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#8",
+      "file": "usr/trim/bin/filemanager",
+      "match": "89 d6 bf 2b e4 ff ff 44",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#9",
+      "file": "usr/trim/bin/filemanager",
+      "match": "e3 ff ff bf 2b e4 ff ff 31 d2",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#10",
+      "file": "usr/trim/bin/filemanager",
+      "match": "?? ?? bf 2b e4 ff ff 4c",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#11",
+      "file": "usr/trim/bin/filemanager",
+      "match": "4c 89 ee bf 2b e4 ff ff e8 aa",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#12",
+      "file": "usr/trim/bin/filemanager",
+      "match": "4c 89 e6 bf 2b e4 ff ff e8 76",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#13",
+      "file": "usr/trim/bin/filemanager",
+      "match": "4c 89 ee bf 2b e4 ff ff e8 f6",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#14",
+      "file": "usr/trim/bin/filemanager",
+      "match": "4c 89 e6 bf 2b e4 ff ff e8 c6",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.2be4->9cff#15",
+      "file": "usr/trim/bin/filemanager",
+      "match": "53 ff ff bf 2b e4 ff ff 31 d2",
+      "replace": [
+        {
+          "find": "2be4",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1,
+      "status": "retired",
+      "retired_reason": "retired"
+    },
+    {
+      "id": "filemanager.b9ab->9cff#16",
+      "file": "usr/trim/bin/filemanager",
+      "match": "31 d2 bf b9 ab ff ff e8",
+      "replace": [
+        {
+          "find": "b9ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "filemanager.b9ab->9cff#17",
+      "file": "usr/trim/bin/filemanager",
+      "match": "fe ff bf b9 ab ff ff 31",
+      "replace": [
+        {
+          "find": "b9ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnfile.so.afab->9cff#18",
+      "file": "usr/trim/lib/libnfile.so",
+      "match": "89 e9 bf af ab ff ff 48",
+      "replace": [
+        {
+          "find": "afab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnfile.so.b3ab->9cff#19",
+      "file": "usr/trim/lib/libnfile.so",
+      "match": "89 fe bf b3 ab ff ff e8",
+      "replace": [
+        {
+          "find": "b3ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.8d->8b#20",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "28 89 6c 24 1c 31 d2 48 8d 74 24 10 44 89 e1 bf b7",
+      "replace": [
+        {
+          "find": "8d",
+          "to": "8b"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.8d->8b#21",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "28 89 6c 24 1c 31 d2 48 8d 74 24 10 44 89 e1 bf b5",
+      "replace": [
+        {
+          "find": "8d",
+          "to": "8b"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.8d->8b#22",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 e2 48 8d 74 24 10",
+      "replace": [
+        {
+          "find": "8d",
+          "to": "8b"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.aeab->9cff#23",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "24 10 bf ae ab ff ff 89",
+      "replace": [
+        {
+          "find": "aeab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.aeab->9cff#24",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 ee bf ae ab ff ff 85",
+      "replace": [
+        {
+          "find": "aeab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.aeab->9cff#25",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 e0 bf ae ab ff ff 83",
+      "replace": [
+        {
+          "find": "aeab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.aeab->9cff#26",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 e9 bf ae ab ff ff e8",
+      "replace": [
+        {
+          "find": "aeab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.b5ab->9cff#27",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 e1 bf b5 ab ff ff e8",
+      "replace": [
+        {
+          "find": "b5ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.b7ab->9cff#28",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "89 e1 bf b7 ab ff ff e8",
+      "replace": [
+        {
+          "find": "b7ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.73797374656d2e7472696d5f61636c->757365722e7472696d5f61636c0000#29",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "00 6e 00 73 79 73 74 65 6d 2e 74 72 69 6d 5f 61 63 6c 00 00 00",
+      "replace": [
+        {
+          "find": "73797374656d2e7472696d5f61636c",
+          "to": "757365722e7472696d5f61636c0000"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.b2ab->9cff#30",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "89 fe bf b2 ab ff ff e9",
+      "replace": [
+        {
+          "find": "b2ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.b8ab->9cff#31",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "00 00 bf b8 ab ff ff 49",
+      "replace": [
+        {
+          "find": "b8ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.b8ab->9cff#32",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "89 fe bf b8 ab ff ff 44",
+      "replace": [
+        {
+          "find": "b8ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.b9ab->9cff#33",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "89 fe bf b9 ab ff ff e8",
+      "replace": [
+        {
+          "find": "b9ab",
+          "to": "9cff"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "network_service.n3-iftype-enum",
+      "kind": "aob",
+      "file": "usr/trim/bin/network_service",
+      "match": "01 00 00 00 02 00 00 00 0a 00 00 00 0e 00 00 00",
+      "replace": [
+        {
+          "find": "0e",
+          "to": "14"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "www.n4-setting-netguard",
+      "kind": "text",
+      "file": "usr/trim/www/assets/Setting-*.js",
+      "find": "e.data.net?.",
+      "to": "e.data?.net?.",
+      "expect": 1,
+      "mirror": {
+        "archive": "usr/trim/share/.restore/www.zip"
+      }
+    },
+    {
+      "id": "www.mem-total-view",
+      "kind": "text",
+      "file": "usr/trim/www/assets/index-*.js",
+      "find": "let{data:e}=await this.runInterceptor(this.interceptors.response,t);if(e.deviceNotify",
+      "to": "let{data:e}=await this.runInterceptor(this.interceptors.response,t);e&&e.data&&e.data.mem&&typeof e.data.mem==\"object\"&&\"reserved\"in e.data.mem&&(e.data.mem.total-=e.data.mem.reserved,e.data.mem.reserved=0);if(e.deviceNotify",
+      "expect": 1,
+      "mirror": {
+        "archive": "usr/trim/share/.restore/www.zip"
+      }
+    },
+    {
+      "id": "resmon_service.veth-kind",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "48 85 c0 0f 84 a7 07 00 00",
+      "replace": [
+        {
+          "find": "48 85 c0",
+          "to": "31 c0 90"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#0",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 30 0c 0b 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 30 0c 0b 00 00 00 00 00",
+          "to": "c7 05 30 0c 0b 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#1",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 ca 0a 0b 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 ca 0a 0b 00 00 00 00 00",
+          "to": "c7 05 ca 0a 0b 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#2",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 ea d7 0a 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 ea d7 0a 00 00 00 00 00",
+          "to": "c7 05 ea d7 0a 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#3",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 83 d6 0a 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 83 d6 0a 00 00 00 00 00",
+          "to": "c7 05 83 d6 0a 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#4",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 3d 43 0a 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 3d 43 0a 00 00 00 00 00",
+          "to": "c7 05 3d 43 0a 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#5",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 29 40 0a 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 29 40 0a 00 00 00 00 00",
+          "to": "c7 05 29 40 0a 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#6",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 b6 9b 04 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 b6 9b 04 00 00 00 00 00",
+          "to": "c7 05 b6 9b 04 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "resmon_service.disk-io-refresh#7",
+      "kind": "aob",
+      "file": "usr/trim/bin/resmon_service",
+      "match": "c7 05 87 74 04 00 00 00 00 00",
+      "replace": [
+        {
+          "find": "c7 05 87 74 04 00 00 00 00 00",
+          "to": "c7 05 87 74 04 00 e8 03 00 00"
+        }
+      ],
+      "expect": 1,
+      "disabled": true,
+      "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "libnfile.so.mode8->2",
+      "kind": "aob",
+      "file": "usr/trim/lib/libnfile.so",
+      "match": "ba 08 00 00 00 4c 89 fe",
+      "replace": [
+        {
+          "find": "08",
+          "to": "02"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnperm.so.lea->mov-rbp",
+      "kind": "aob",
+      "file": "usr/trim/lib/libnperm.so",
+      "match": "48 89 6c 24 10 48 8d 6c 24 10",
+      "replace": [
+        {
+          "find": "8d",
+          "to": "8b"
+        }
+      ],
+      "expect": 1
+    }
+  ],
+  "file_hashes": {
+    "usr/trim/lib/libnfile.so": {
+      "orig": "143528bd9e0b7966503c1474de308fb9d7e998b660a5ec3363deae49a45d1979",
+      "patched": "e1a4448dbb5dcc50c517c54b98e4d79d1e69067570905af23d6dfb08afd09a65"
+    },
+    "usr/trim/lib/libnperm.so": {
+      "orig": "013e142aa1852ee2d5e01d2826bfa3a410338377a1a117ec616813fa45b4252f",
+      "patched": "4b76240ae958299e2fa75f42c3d0bc03716785c5c0e6ffcd5d3f795cafa9b2f6"
+    },
+    "usr/trim/lib/libtrimacl.so": {
+      "orig": "65b124dd045539ffae935b89315e374c5eb5a5c55cf6f4b3c759d1879c2fcd1a",
+      "patched": "9cefa3f8d69757c0330965805e14ea9b43d560b2ff0294cbbb267313e9416a3a"
+    },
+    "usr/trim/bin/filemanager": {
+      "orig": "6586752ba84d26448255b2582cde0dac6c897f3b8768e68895a3f85914de1dd3",
+      "patched": "a5203bb3e43dacfcf10be517530fbe32c584d664ac305018ddc8a0cd3bc40e87"
+    },
+    "usr/trim/bin/network_service": {
+      "orig": "90bc1045af08bb75477dbe888e31af1d23872f8f47a86620fadd5417ded27fd1",
+      "patched": "226fcd3b959c8a6a09c1f71920cdef381893c79992d0e8ee14cf21a3d904fe37"
+    },
+    "usr/trim/bin/resmon_service": {
+      "orig": "e5c76758f6c897680c0a9aa8efecf95e2d906db6b35eddcc97520d6df36160dc",
+      "patched": [
+        "9a5af10e65a07729f78cacb7583515fb3db16f7a6a421e78cef390b2a22c21ec",
+        "231f239460c7e6d3bd75e54040f762e953766a403b18cc9e2b3c47089c80e5ee"
+      ]
+    }
+  }
+}
