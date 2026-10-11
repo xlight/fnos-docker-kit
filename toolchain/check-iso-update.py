@@ -6,6 +6,10 @@ UA/Referer/cookie 均无效，属 IP/ASN 层拦截），故"发现新版"与"能
 
 用法：
   python3 check-iso-update.py [--page URL] [--state <file>] [--probe/--no-probe]
+                              [--signed/--no-signed]
+
+  --signed：在确定当前版本后，再调官网 download-sign 换签名 URL
+  （输出 signed_url；CI 下载用它，不用裸 URL）。
 
 输出：JSON 到 stdout，形如：
   {"current": {"version": "1.2.0701", "url": "...", "hash": "..."},
@@ -23,6 +27,9 @@ import urllib.request
 
 PAGE = "https://fnnas.com/download"
 STATE_ENV = "ISO_STATE_FILE"
+SIGN_PATH = "/asset/download-sign"
+SIGN_S1 = "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh"
+SIGN_S2 = "4fac7e99-ef43-4b6c-9ca8-5bbca4a4210e"
 
 # 页面内嵌转义 JSON：download\":{\"version\":\"X\",\"url\":\"...\",\"hash\":\"...\",...}
 RE_BLOCK = re.compile(
@@ -51,10 +58,34 @@ def probe(url, timeout=20):
         return False
 
 
+def sign_url(url, timeout=20):
+    """调官网 download-sign 接口换签名 URL（authx 算法逆自官网前端，可公开复现）。
+    返回签名 URL；失败抛异常。"""
+    import hashlib
+    import random
+    import time
+    md5 = lambda s: hashlib.md5(s.encode()).hexdigest()
+    data = json.dumps({"url": url}, separators=(",", ":"))
+    nonce = str(random.randint(100000, 999999))
+    ts = str(int(time.time() * 1000))
+    inner = md5(data)
+    c = "_".join([SIGN_S1, SIGN_PATH, nonce, ts, inner, SIGN_S2])
+    authx = "nonce=%s&timestamp=%s&sign=%s" % (nonce, ts, md5(c))
+    req = urllib.request.Request(
+        "https://fnnas.com" + SIGN_PATH, data=data.encode(),
+        headers={"Content-Type": "application/json", "authx": authx,
+                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
+                 "Origin": "https://fnnas.com",
+                 "Referer": "https://fnnas.com/download"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)["url"]
+
+
 def main():
     page = PAGE
     state_file = os.environ.get(STATE_ENV, "")
     do_probe = True
+    do_sign = False
     args = sys.argv[1:]
     i = 0
     while i < len(args):
@@ -64,6 +95,8 @@ def main():
             state_file, i = args[i + 1], i + 1
         elif args[i] == "--no-probe":
             do_probe = False
+        elif args[i] == "--signed":
+            do_sign = True
         i += 1
     try:
         html = fetch(page)
@@ -87,6 +120,12 @@ def main():
            "downloadable": None}
     if do_probe:
         out["downloadable"] = probe(cur["url"])
+    if do_sign:
+        try:
+            out["signed_url"] = sign_url(cur["url"])
+        except Exception as e:
+            out["signed_url"] = None
+            out["sign_error"] = str(e)[:200]
     print(json.dumps(out, ensure_ascii=False))
     if state_file:
         open(state_file, "w").write(cur["version"] + "\n")

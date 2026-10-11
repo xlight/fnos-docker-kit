@@ -52,12 +52,12 @@ jobs:
             # 注意：Actions 默认 bash -e，检测器 rc=10/11 会直接杀死 step，
             # 必须先关 -e 取回 rc 再恢复
             set +e
-            out=$(python3 toolchain/check-iso-update.py --no-probe); rc=$?
+            out=$(python3 toolchain/check-iso-update.py --signed); rc=$?
             set -e
             # rc=0 无变化（仍继续：幂等复验当前版）；rc=2 检测故障
             if [ "$rc" = "2" ]; then echo "$out"; exit 1; fi
             ver=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['version'])")
-            url=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['url'])")
+            url=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signed_url') or json.load(sys.stdin)['current']['url'])")
             hsh=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['hash'])")
             echo "version=$ver" >> "$GITHUB_OUTPUT"
             echo "iso_url=$url" >> "$GITHUB_OUTPUT"
@@ -85,10 +85,12 @@ jobs:
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
             -r 0-1023 "${{ steps.detect.outputs.iso_url }}")
+          # 输出口径必须干净（yes/no），下游用精确匹配；http 码只打日志
+          echo "直链探测 http=$code"
           if [ "$code" = "200" ] || [ "$code" = "206" ]; then
             echo "downloadable=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "downloadable=no (http=$code)" >> "$GITHUB_OUTPUT"
+            echo "downloadable=no" >> "$GITHUB_OUTPUT"
           fi
 
   selfcheck:
