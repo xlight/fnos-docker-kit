@@ -49,7 +49,11 @@ jobs:
             echo "iso_hash=" >> "$GITHUB_OUTPUT"
             echo "descent=manual" >> "$GITHUB_OUTPUT"
           else
+            # 注意：Actions 默认 bash -e，检测器 rc=10/11 会直接杀死 step，
+            # 必须先关 -e 取回 rc 再恢复
+            set +e
             out=$(python3 toolchain/check-iso-update.py --no-probe); rc=$?
+            set -e
             # rc=0 无变化（仍继续：幂等复验当前版）；rc=2 检测故障
             if [ "$rc" = "2" ]; then echo "$out"; exit 1; fi
             ver=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['version'])")
