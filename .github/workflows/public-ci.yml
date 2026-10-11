@@ -102,6 +102,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 安装构建依赖（对齐 toolchain/deps.sh 最小集）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq genisoimage e2fsprogs zip unzip
+          for t in isoinfo mkfs.ext4 e2fsck unzip zip; do
+            command -v "$t" >/dev/null || { echo "缺工具: $t"; exit 1; }
+          done
+
       - name: 磁盘断言（物料峰值约 20G）
         run: |
           avail=$(df --output=avail -BG "$RUNNER_TEMP" | tail -1 | tr -dc 0-9)
@@ -117,6 +125,12 @@ jobs:
         run: |
           curl -fL --retry 3 -o /tmp/fnos.iso "${{ needs.detect.outputs.iso_url }}"
           ls -la /tmp/fnos.iso
+          want="${{ needs.detect.outputs.iso_hash }}"
+          if [ -n "$want" ]; then
+            got=$(sha256sum /tmp/fnos.iso | awk '{print $1}')
+            [ "$got" = "$want" ] || { echo "ISO hash 不符: want=$want got=$got"; exit 1; }
+            echo "ISO hash 一致"
+          fi
 
       - name: extract 出厂 rootfs
         run: |
