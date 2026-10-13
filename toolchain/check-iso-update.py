@@ -160,6 +160,9 @@ def main():
             return 2
         out["ota"] = {"version": over}
         out["ota_newer"] = _vkey(over) > _vkey(cur["version"])
+        # 人类可读行走 stderr（stdout 只留 JSON，下游按 JSON 解析）
+        print("[ota] trim=%s ota_newer=%s (page=%s)" % (over, out["ota_newer"], cur["version"]),
+              file=sys.stderr, flush=True)
     if do_probe:
         out["downloadable"] = probe(cur["url"])
     if do_sign:

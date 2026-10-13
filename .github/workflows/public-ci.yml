@@ -70,6 +70,7 @@ jobs:
             # OTA 预警只记录、不触发构建（无 ISO 不可构建；见 spec）
             echo "ota_version=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or '')")" >> "$GITHUB_OUTPUT"
             echo "ota_newer=$(echo "$out" | python3 -c "import sys,json; print('true' if json.load(sys.stdin).get('ota_newer') else 'false')")" >> "$GITHUB_OUTPUT"
+            echo "OTA: version=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or 'n/a')") newer=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ota_newer'))") (page=$ver)"
           fi
 
       - name: 查 Hub 是否已发布该版本（天然去重）
