@@ -19,6 +19,9 @@ set -uo pipefail
 CMD="${1:-}"; ID="${2:-}"
 STORAGE="${STORAGE:-}"; SIZE=12; IMAGE=""; HOSTNAME_="fnos-lxc"
 CPUS=2; MEM=2048; NO_START=0
+# 镜像内需 mask 的单元（与 fnos_patch.py 的 MASK_UNITS 保持一致；空格分隔）
+# nfsd 是宿主内核全局态，容器内跑 nfs-server 会直接在宿主起 rpc.nfsd 并与其它实例互踩。
+MASK_UNITS="nfs-server.service"
 # 网络 IP：默认 DHCP；可设静态以避开被网关屏蔽的 IP（见 README「静态 IP / WAN 出口」）。
 #   形式同 PVE net0： "<addr>/<mask>" 或 "<addr>/<mask>,gw=<gw>"。例：
 #   FNOS_CT_IP="192.168.199.199/24,gw=192.168.199.1" fnos_deploy.sh install 201
@@ -293,6 +296,10 @@ smoke() {
   chk "fnos-dirfd-shim.service 已 enable (=$u)" "$([ "$u" = enabled ] && echo 1 || echo 0)"
   w="$(pct exec "$id" -- systemctl is-enabled fnos-aob-www.service 2>/dev/null || echo '')"
   chk "fnos-aob-www.service 已 enable (=$w)" "$([ "$w" = enabled ] && echo 1 || echo 0)"
+  for u in $MASK_UNITS; do
+    m="$(pct exec "$id" -- systemctl is-enabled "$u" 2>/dev/null || echo '')"
+    chk "$u 已 mask（宿主全局 nfsd 防互踩） (=$m)" "$([ "$m" = masked ] && echo 1 || echo 0)"
+  done
 
   echo "== [5] /proc/mounts 无 trimafs、/fs 为普通目录 =="
   m="$(pct exec "$id" -- sh -c 'grep -c trimafs /proc/mounts 2>/dev/null || true')"

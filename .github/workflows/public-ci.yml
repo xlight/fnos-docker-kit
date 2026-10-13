@@ -121,10 +121,10 @@ jobs:
           ls "toolchain/patches/fnos-${VERSION#V}.json" \
             || { echo "无该版本补丁集，需人工 rebase"; exit 1; }
 
-      - name: 恢复 ISO 缓存（按版本 key；命中则跳过下载）
+      - name: 恢复 ISO 缓存（按版本 key；命中则跳过下载，纯恢复无 post 存）
         id: iso-cache
         if: needs.detect.outputs.version != 'manual'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/fnos.iso
           key: fnos-iso-${{ needs.detect.outputs.version }}
@@ -157,6 +157,13 @@ jobs:
             fi
             echo "ISO hash 一致"
           fi
+
+      - name: 即刻存 ISO 缓存（不等 job 结束；后段失败也不白下）
+        if: steps.iso-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/fnos.iso
+          key: fnos-iso-${{ needs.detect.outputs.version }}
 
       - name: extract 出厂 rootfs
         run: |

@@ -2,7 +2,7 @@
 # ============================================================================
 # fnos_patch.py — 把一个出厂 rootfs 打成"可运行的 fnOS LXC rootfs"
 #
-# 四件事（全部幂等）：
+# 五件事（全部幂等）：
 #   1) /etc/fstab 改写（去 install-UUID root、/boot/efi、trimafs /fs）
 #   2) 镜像内 mount 垫片 /usr/local/sbin/mount（剥 trimacl）
 #   3) AOB 特征补丁（usr/trim 下目标二进制）
@@ -16,6 +16,7 @@
 #            （磁盘 I/O 刷新 opt-in：仅烘焙、**不 enable**；启用见 README）
 #        /usr/local/lib/libfnos-trashshim.so + trim_main.service.d/trashshim.conf
 #            （回收站用户态 wrapper：LD_PRELOAD 挂到 trim，其派生 filemanager 生效）
+#   5) 屏蔽 nfs-server（见下方 MASK_UNITS 注释：宿主全局 nfsd 互踩防护）
 #
 # 用法（需 root）：
 #   fnos_patch.py apply  --rootfs <dir> [--patches <json>] [--mount-shim <sh>]
@@ -107,6 +108,20 @@ TRASH_DROPIN_BODY = (
     "[Service]\n"
     "Environment=LD_PRELOAD=/usr/local/lib/libfnos-trashshim.so\n"
 )
+
+# ---- 需在镜像内屏蔽的 systemd 单元 ----
+# 背景（2026-10-11 事故复盘）：nfsd 的 /proc/net/rpc/nfsd.* 是**宿主内核全局态**——
+# 在容器里跑 fnOS 的 nfs-server，等于直接在宿主起 rpc.nfsd。多个 fnOS 实例
+# （CT200 + 数个 docker 容器，其中一个已删但 rpc.nfsd 泄漏）并发起停会互踩：
+#   rpc.nfsd 卡在 nfsd_svc → nfsd4_cld_grace_done（不可中断 D）
+#     ↓ 持有 sunrpc cache 锁
+#   exportfs -r 卡在 write_flush → expkey_flush（D）
+#     ↓ 容器 shutdown 永远等不到它退出
+#   PID1 死在 zap_pid_ns_processes → 容器"杀不掉/exec 不进"，只能重启宿主
+# 容器场景不需要对外提供 NFS，故镜像内直接 mask。
+# 代价：fnOS 的「NFS 共享」特性随之不可用。如需恢复：删 rootfs 内
+#       /etc/systemd/system/<unit> 这个指向 /dev/null 的符号链接即可。
+MASK_UNITS = ("nfs-server.service",)
 
 DIRFD_SHIM = """#!/usr/bin/env python3
 # 开机幂等重放 AOB 补丁（自愈网：应对 fnOS 自更新把二进制换回原版）。
@@ -208,6 +223,26 @@ def enable_unit(rootfs, name, target="multi-user.target"):
         os.symlink("/etc/systemd/system/%s" % name, link)
 
 
+def _is_masked(rootfs, name):
+    p = os.path.join(rootfs, "etc/systemd/system", name)
+    return os.path.islink(p) and os.readlink(p) == "/dev/null"
+
+
+def mask_unit(rootfs, name):
+    """屏蔽 systemd 单元：/etc/systemd/system/<name> -> /dev/null（幂等）。
+
+    原厂单元本体在 /lib/systemd/system/ 下，故 /etc/... 这个路径正常不存在；
+    若已存在同名文件（旧构建残留）先移除再建链接。
+    """
+    link = os.path.join(rootfs, "etc/systemd/system", name)
+    os.makedirs(os.path.dirname(link), exist_ok=True)
+    if _is_masked(rootfs, name):
+        return
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink("/dev/null", link)
+
+
 def read_rootfs_version(rootfs):
     """读取 rootfs 的 fnOS 版本（`usr/trim/etc/version`，形如 `1.2.0701`）。"""
     for rel in ("usr/trim/etc/version", "usr/trim/etc/VERSION"):
@@ -268,6 +303,11 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
     enable_unit(rootfs, "fnos-mountdir.service")
     enable_unit(rootfs, "fnos-nic-fuse.service", "sysinit.target")
     # 注意：fnos-disk-io-monitor.service **刻意不 enable**（磁盘 I/O 补丁默认不生效）。
+    # 屏蔽 nfs-server：nfsd 是宿主内核全局态，容器内多实例互踩会 wedge 宿主（见 MASK_UNITS 注释）。
+    for u in MASK_UNITS:
+        mask_unit(rootfs, u)
+    log.append("masked units: %s（宿主全局 nfsd 防互踩；fnOS NFS 共享特性随之不可用，"
+               "删 /etc/systemd/system/<unit> 符号链接可恢复）" % ", ".join(MASK_UNITS))
     log.append("container-side units baked + enabled（含 NIC NM fuse + AOB 文本相；"
                "disk-io opt-in 单元仅烘焙、未 enable）")
     return log
@@ -296,7 +336,7 @@ def _active_fstab_lines(rootfs):
 
 def status(rootfs):
     active = _active_fstab_lines(rootfs)
-    return {
+    st = {
         "fstab(no active trimafs/efi/uuid-root)": active is not None and not any(
             ("trimafs" in l) or ("/boot/efi" in l) or l.split()[1:2] == ["/"] for l in active),
         "mount shim": os.path.exists(os.path.join(rootfs, "usr/local/sbin/mount")),
@@ -311,8 +351,14 @@ def status(rootfs):
         "trash wrapper so": os.path.exists(os.path.join(rootfs, TRASH_SO)),
         "trash wrapper dropin": os.path.exists(os.path.join(rootfs, TRASH_DROPIN)),
         "disk-io opt-in unit baked": os.path.exists(os.path.join(rootfs, "etc/systemd/system/fnos-disk-io-monitor.service")),
-        "disk-io opt-in unit enabled(应默认 False)": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-disk-io-monitor.service")),
+        # 注意：status 的契约是"全 true = 健康"（stage_patch 用 all(values()) 判幂等），
+        # 故这里表达"默认未启用"这个**健康态**，而不是"是否启用"（后者健康时为 False 会误判失败）。
+        "disk-io opt-in disabled by default": not os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-disk-io-monitor.service")),
     }
+    # nfs-server 屏蔽（宿主全局 nfsd 防互踩）
+    for u in MASK_UNITS:
+        st["masked: %s" % u] = _is_masked(rootfs, u)
+    return st
 
 
 def main():
