@@ -34,6 +34,8 @@ jobs:
       iso_url: ${{ steps.detect.outputs.iso_url }}
       iso_hash: ${{ steps.detect.outputs.iso_hash }}
       descent: ${{ steps.detect.outputs.descent }}
+      ota_version: ${{ steps.detect.outputs.ota_version }}
+      ota_newer: ${{ steps.detect.outputs.ota_newer }}
       build: ${{ steps.gate.outputs.build }}
       downloadable: ${{ steps.probe.outputs.downloadable }}
     steps:
@@ -48,6 +50,8 @@ jobs:
             echo "iso_url=${{ inputs.iso_url }}" >> "$GITHUB_OUTPUT"
             echo "iso_hash=" >> "$GITHUB_OUTPUT"
             echo "descent=manual" >> "$GITHUB_OUTPUT"
+            echo "ota_version=" >> "$GITHUB_OUTPUT"
+            echo "ota_newer=false" >> "$GITHUB_OUTPUT"
           else
             # 注意：Actions 默认 bash -e，检测器 rc=10/11 会直接杀死 step，
             # 必须先关 -e 取回 rc 再恢复
@@ -63,6 +67,9 @@ jobs:
             echo "iso_url=$url" >> "$GITHUB_OUTPUT"
             echo "iso_hash=$hsh" >> "$GITHUB_OUTPUT"
             echo "descent=auto" >> "$GITHUB_OUTPUT"
+            # OTA 预警只记录、不触发构建（无 ISO 不可构建；见 spec）
+            echo "ota_version=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or '')")" >> "$GITHUB_OUTPUT"
+            echo "ota_newer=$(echo "$out" | python3 -c "import sys,json; print('true' if json.load(sys.stdin).get('ota_newer') else 'false')")" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 查 Hub 是否已发布该版本（天然去重）
@@ -272,6 +279,28 @@ jobs:
         run: |
           gh issue create --title "ISO detector failed $(date -u +%F)" \
             --body "版本检测器抓取/解析失败（非'无新版'）。请检查官网下载页结构是否变更。"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  ota-watch:
+    needs: detect
+    if: needs.detect.result == 'success' && needs.detect.outputs.ota_newer == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      issues: write
+    steps:
+      - name: OTA 领先预警（有新版、无 ISO，不触发构建）
+        run: |
+          over="${{ needs.detect.outputs.ota_version }}"
+          page="${{ needs.detect.outputs.version }}"
+          title="OTA early warning: $over (ISO not yet listed)"
+          # 幂等：同标题 open Issue 已存在则不再开
+          n=$(gh issue list --state open --search "$title in:title" --json number --jq length)
+          if [ "$n" = "0" ]; then
+            gh issue create --title "$title" --body "OTA 清单已见 trim $over，但下载页仍是 $page（无 ISO 不可构建）。rebase 预热窗口；ISO 上架后本 Issue 可关闭。"
+          else
+            echo "预警 Issue 已存在，跳过"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
