@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""check-iso-update.py —— 检测 fnOS 官方新版（双通道：下载页触发 + OTA 预警）。
+"""check-iso-update.py —— 检测 fnOS 官方新版（双通道双分支：下载页触发 ISO 分支 + OTA 触发 deb 分支）。
 
 背景：官网直链裸访 403（缺签名——ISO 走 download-sign 现签，.deb 走 manifest
 dlkey 自签），故"发现新版"与"能下载"必须分开判定。
 
 用法：
-  python3 check-iso-update.py [--page URL] [--state <file>] [--probe/--no-probe]
-                              [--signed/--no-signed] [--no-ota]
+  python3 check-iso-update.py [--page URL] [--state <file>] [--ota-state <file>]
+                              [--probe/--no-probe] [--signed/--no-signed] [--no-ota]
 
   --signed：在确定当前版本后，再调官网 download-sign 换签名 URL
   （输出 signed_url；CI 下载用它，不用裸 URL）。
-  --no-ota：跳过 OTA 预警通道（默认开启；本地离线调试用）。
+  --no-ota：跳过 OTA 通道（默认开启；本地离线调试用）。
+  --state：记录下载页版本号（ISO 分支去重）；--ota-state：记录 OTA trim
+  版本（deb 分支去重）。两 state 各记各的，互不阻塞。
 
 通道：
-  下载页嵌 JSON（版本号 + 官方 hash）→ 构建触发（changed/downloadable）。
+  下载页嵌 JSON（版本号 + 官方 hash）→ ISO 分支触发（changed/downloadable）。
   OTA 版本清单（apiv2-liveupdate 根路径匿名 GET，trim.version 为准）
-    → 只记 ota/ota_newer 预警，MUST NOT 触发构建（无 ISO 不可构建）。
-任一通道失败 → rc=2（告警，不更新 state）。
+    → deb 分支触发（ota_changed；CI 侧再查 Hub 有无对应 X-ota tag 去重，
+    有底座（Hub 上低于目标版本的最高 tag）才构建）。
+任一通道失败 → rc=2（告警，不更新任何 state）。
 
 输出：JSON 到 stdout，形如：
   {"current": {"version": "1.2.0701", "url": "...", "hash": "..."},
    "recorded": "1.2.0701", "changed": false, "downloadable": true,
-   "ota": {"version": "1.2.0800"}, "ota_newer": true}
+   "ota": {"version": "1.2.0800"}, "ota_newer": true, "ota_changed": true}
 
 退出码：0=无变化；10=有新版且可下载；11=有新版但下载被拦；
          2=任一通道抓取/解析失败（告警，不更新 state）。
@@ -115,6 +118,7 @@ def sign_url(url, timeout=20):
 def main():
     page = PAGE
     state_file = os.environ.get(STATE_ENV, "")
+    ota_state_file = ""
     do_probe = True
     do_sign = False
     do_ota = True
@@ -125,6 +129,8 @@ def main():
             page, i = args[i + 1], i + 1
         elif args[i] == "--state" and i + 1 < len(args):
             state_file, i = args[i + 1], i + 1
+        elif args[i] == "--ota-state" and i + 1 < len(args):
+            ota_state_file, i = args[i + 1], i + 1
         elif args[i] == "--no-probe":
             do_probe = False
         elif args[i] == "--signed":
@@ -160,8 +166,14 @@ def main():
             return 2
         out["ota"] = {"version": over}
         out["ota_newer"] = _vkey(over) > _vkey(cur["version"])
+        recorded_ota = ""
+        if ota_state_file and os.path.isfile(ota_state_file):
+            recorded_ota = open(ota_state_file).read().strip()
+        out["ota_recorded"] = recorded_ota
+        out["ota_changed"] = (over != recorded_ota) if recorded_ota else True
         # 人类可读行走 stderr（stdout 只留 JSON，下游按 JSON 解析）
-        print("[ota] trim=%s ota_newer=%s (page=%s)" % (over, out["ota_newer"], cur["version"]),
+        print("[ota] trim=%s ota_newer=%s ota_changed=%s (page=%s)" % (
+            over, out["ota_newer"], out["ota_changed"], cur["version"]),
               file=sys.stderr, flush=True)
     if do_probe:
         out["downloadable"] = probe(cur["url"])
@@ -174,6 +186,8 @@ def main():
     print(json.dumps(out, ensure_ascii=False))
     if state_file:
         open(state_file, "w").write(cur["version"] + "\n")
+    if do_ota and ota_state_file and out.get("ota", {}).get("version"):
+        open(ota_state_file, "w").write(out["ota"]["version"] + "\n")
     if not out["changed"]:
         return 0
     if not do_probe:

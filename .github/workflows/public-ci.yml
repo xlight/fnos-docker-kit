@@ -1,12 +1,18 @@
 # 公开 CI 自检 + 自动发布（无需 PVE；GitHub-hosted runner）
-# 设计来源：fnos-public-release-split D5（自检）+ D7（release automation 落点）。
+# 设计来源：fnos-public-release-split D5（自检）+ D7（release automation 落点）；
+# 双分支见 fnos-docker-auto-release D9（FAN-IN：头分叉 + 尾共享）。
 # 触发：
-#   - workflow_dispatch（手动；可指定 iso_url / version 跳过自动检测）
+#   - workflow_dispatch（手动；可指定 iso_url / version 跳过自动检测；
+#     promote_latest 显式才动 latest，默认只推版本 tag）
 #   - schedule：每天一次（版本监控）
 # 流程：
-#   detect（check-iso-update.py）→ 查 Hub tag 去重 → 下载 → 自检构建 →
-#   成功推镜像（版本 tag + latest）/ 失败按原因开不同 Issue
+#   detect（check-iso-update.py 双通道 + Hub tag 去重 + 底座选择）→
+#   build（二选一准备 rootfs：ISO 现签下载/extract，或底座 export+.deb 覆盖；
+#     FAN-IN 后共用尾巴 check→apply→mkraw→mask→import→参数化推送）→
+#   成功按分支推镜像（ISO: 版本 tag + latest；deb: X-ota，永不 latest）/
+#   失败按原因开不同 Issue
 # 状态机（检测器 rc）：0=无变化；10=有新版且可下载；11=有新版但下载被拦；2=检测故障
+# 分支（detect.outputs.branch）：iso / deb / none（ Hub tag 即 state：查 X 查 X-ota）
 name: public-ci
 
 on:
@@ -20,6 +26,11 @@ on:
         description: "fnOS 版本（如 1.2.0701，留空则自动检测）"
         required: false
         default: ""
+      promote_latest:
+        description: "同时推进 latest（默认只推版本 tag）"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "0 2 * * *"
 
@@ -30,69 +41,103 @@ jobs:
   detect:
     runs-on: ubuntu-22.04
     outputs:
-      version: ${{ steps.detect.outputs.version }}
-      iso_url: ${{ steps.detect.outputs.iso_url }}
-      iso_hash: ${{ steps.detect.outputs.iso_hash }}
-      descent: ${{ steps.detect.outputs.descent }}
-      ota_version: ${{ steps.detect.outputs.ota_version }}
-      ota_newer: ${{ steps.detect.outputs.ota_newer }}
-      build: ${{ steps.gate.outputs.build }}
-      downloadable: ${{ steps.probe.outputs.downloadable }}
+      version: ${{ steps.decide.outputs.version }}
+      branch: ${{ steps.decide.outputs.branch }}
+      tag: ${{ steps.decide.outputs.tag }}
+      move_latest: ${{ steps.decide.outputs.move_latest }}
+      iso_url: ${{ steps.decide.outputs.iso_url }}
+      iso_hash: ${{ steps.decide.outputs.iso_hash }}
+      base_tag: ${{ steps.decide.outputs.base_tag }}
+      descent: ${{ steps.decide.outputs.descent }}
+      ota_version: ${{ steps.decide.outputs.ota_version }}
+      build: ${{ steps.decide.outputs.build }}
+      downloadable: ${{ steps.probe.outputs.downloadable || steps.probe-deb.outputs.downloadable }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 自动检测（手动输入优先）
-        id: detect
+      - name: 双通道检测 + 分支决策（手动输入优先）
+        id: decide
         run: |
+          hub_tag_exists() { # <tag> -> 0=存在
+            [ "$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/$1")" = "200" ]
+          }
+          pick_base() { # <target> -> 低于目标版本的最高 Hub tag（数字相同优先无 -ota；无则空）
+            python3 -c "
+          import json, re, urllib.request
+          tgt = tuple(int(x) for x in re.findall(r'\d+', '$1'))
+          try:
+              u = 'https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags?page_size=100'
+              names = [t['name'] for t in json.load(urllib.request.urlopen(u, timeout=30))['results']]
+          except Exception:
+              names = []
+          best = ''
+          bestk = None
+          for n in names:
+              v = tuple(int(x) for x in re.findall(r'\d+', n))
+              if not v or not (v < tgt):
+                  continue
+              k = (v, 0 if not n.endswith('-ota') else 1)
+              if bestk is None or k > bestk:
+                  best, bestk = n, k
+          print(best)
+          "
+          }
           if [ -n "${{ inputs.iso_url }}" ]; then
             ver="${{ inputs.version }}"; [ -n "$ver" ] || ver="manual"
             echo "version=$ver" >> "$GITHUB_OUTPUT"
+            echo "branch=iso" >> "$GITHUB_OUTPUT"
+            echo "tag=$ver" >> "$GITHUB_OUTPUT"
+            if [ "${{ inputs.promote_latest }}" = "true" ]; then echo "move_latest=true" >> "$GITHUB_OUTPUT";
+            else echo "move_latest=false" >> "$GITHUB_OUTPUT"; fi
             echo "iso_url=${{ inputs.iso_url }}" >> "$GITHUB_OUTPUT"
             echo "iso_hash=" >> "$GITHUB_OUTPUT"
+            echo "base_tag=" >> "$GITHUB_OUTPUT"
             echo "descent=manual" >> "$GITHUB_OUTPUT"
             echo "ota_version=" >> "$GITHUB_OUTPUT"
-            echo "ota_newer=false" >> "$GITHUB_OUTPUT"
+            echo "build=yes" >> "$GITHUB_OUTPUT"
           else
             # 注意：Actions 默认 bash -e，检测器 rc=10/11 会直接杀死 step，
             # 必须先关 -e 取回 rc 再恢复
             set +e
             out=$(python3 toolchain/check-iso-update.py --signed); rc=$?
             set -e
-            # rc=0 无变化（仍继续：幂等复验当前版）；rc=2 检测故障
+            # rc=2 检测故障（detect-issue 接管）；rc=0/10/11 都继续走 Hub 去重
             if [ "$rc" = "2" ]; then echo "$out"; exit 1; fi
             ver=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['version'])")
             url=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('signed_url') or json.load(sys.stdin)['current']['url'])")
             hsh=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['current']['hash'])")
+            ota=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or '')")
             echo "version=$ver" >> "$GITHUB_OUTPUT"
-            echo "iso_url=$url" >> "$GITHUB_OUTPUT"
-            echo "iso_hash=$hsh" >> "$GITHUB_OUTPUT"
             echo "descent=auto" >> "$GITHUB_OUTPUT"
-            # OTA 预警只记录、不触发构建（无 ISO 不可构建；见 spec）
-            echo "ota_version=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or '')")" >> "$GITHUB_OUTPUT"
-            echo "ota_newer=$(echo "$out" | python3 -c "import sys,json; print('true' if json.load(sys.stdin).get('ota_newer') else 'false')")" >> "$GITHUB_OUTPUT"
-            echo "OTA: version=$(echo "$out" | python3 -c "import sys,json; print((json.load(sys.stdin).get('ota') or {}).get('version') or 'n/a')") newer=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ota_newer'))") (page=$ver)"
+            echo "ota_version=$ota" >> "$GITHUB_OUTPUT"
+            branch=none; tag=""; move_latest=false; base=""
+            if ! hub_tag_exists "$ver"; then
+              branch=iso; tag="$ver"; move_latest=true
+              echo "iso_url=$url" >> "$GITHUB_OUTPUT"
+              echo "iso_hash=$hsh" >> "$GITHUB_OUTPUT"
+            elif [ -n "$ota" ] && [ "$ota" != "$ver" ] && ! hub_tag_exists "$ota-ota"; then
+              branch=deb; tag="$ota-ota"; move_latest=false
+              echo "version=$ota" >> "$GITHUB_OUTPUT"
+              base=$(pick_base "$ota")
+              echo "base_tag=$base" >> "$GITHUB_OUTPUT"
+              echo "deb 底座: ${base:-<无，构建将显式失败走 blocked-issue>}"
+            fi
+            # ISO 优先：同轮两分支都缺时全量构建覆盖（deb 下轮 Hub 去重自然跳过）
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "move_latest=$move_latest" >> "$GITHUB_OUTPUT"
+            if [ "$branch" = "none" ]; then echo "build=no" >> "$GITHUB_OUTPUT";
+            else echo "build=yes" >> "$GITHUB_OUTPUT"; fi
+            echo "DECIDE: page=$ver ota=$ota branch=$branch tag=$tag"
           fi
 
-      - name: 查 Hub 是否已发布该版本（天然去重）
-        id: gate
-        run: |
-          ver="${{ steps.detect.outputs.version }}"
-          if [ "$ver" = "manual" ]; then echo "build=yes" >> "$GITHUB_OUTPUT"; exit 0; fi
-          code=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPO}/tags/$ver")
-          if [ "$code" = "200" ]; then
-            echo "Hub 已有 $ver，跳过构建"
-            echo "build=no" >> "$GITHUB_OUTPUT"
-          else
-            echo "build=yes" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: 探测直链可下载性
+      - name: 探测直链可下载性（仅 ISO 分支）
         id: probe
-        if: steps.gate.outputs.build == 'yes'
+        if: steps.decide.outputs.build == 'yes' && steps.decide.outputs.branch == 'iso'
         run: |
           code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
-            -r 0-1023 "${{ steps.detect.outputs.iso_url }}")
+            -r 0-1023 "${{ steps.decide.outputs.iso_url }}")
           # 输出口径必须干净（yes/no），下游用精确匹配；http 码只打日志
           echo "直链探测 http=$code"
           if [ "$code" = "200" ] || [ "$code" = "206" ]; then
@@ -100,13 +145,21 @@ jobs:
           else
             echo "downloadable=no" >> "$GITHUB_OUTPUT"
           fi
+      - name: deb 分支无需直链探测（.deb 现签现用，自带 fail-stop）
+        id: probe-deb
+        if: steps.decide.outputs.build == 'yes' && steps.decide.outputs.branch == 'deb'
+        run: echo "downloadable=yes" >> "$GITHUB_OUTPUT"
 
-  selfcheck:
+  build:
     needs: detect
     if: needs.detect.outputs.build == 'yes' && needs.detect.outputs.downloadable != 'no'
     runs-on: ubuntu-22.04
+    outputs:
+      patchset: ${{ steps.patchset-gate.outputs.patchset }}
     env:
       VERSION: ${{ needs.detect.outputs.version }}
+      BRANCH: ${{ needs.detect.outputs.branch }}
+      TAG: ${{ needs.detect.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -114,24 +167,29 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq genisoimage e2fsprogs zip unzip
-          for t in isoinfo mkfs.ext4 e2fsck unzip zip; do
+          for t in isoinfo mkfs.ext4 e2fsck unzip zip dpkg-deb; do
             command -v "$t" >/dev/null || { echo "缺工具: $t"; exit 1; }
           done
 
-      - name: 磁盘断言（物料峰值约 20G）
+      - name: 磁盘断言（ISO 头物料峰值约 20G；deb 头约底座 4G + 包组 1G + 解包）
         run: |
           avail=$(df --output=avail -BG "$RUNNER_TEMP" | tail -1 | tr -dc 0-9)
           echo "可用磁盘: ${avail}G"
           [ "$avail" -ge 25 ] || { echo "磁盘不足，中止"; exit 1; }
 
-      - name: 补丁集存在性（缺失=需 rebase，直接失败）
+      - name: 补丁集门禁（缺失=需人工 rebase，本 step 只标记不失败）
+        id: patchset-gate
         run: |
-          ls "toolchain/patches/fnos-${VERSION#V}.json" \
-            || { echo "无该版本补丁集，需人工 rebase"; exit 1; }
+          if ls "toolchain/patches/fnos-${VERSION#V}.json" >/dev/null 2>&1; then
+            echo "patchset=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "patchset=missing" >> "$GITHUB_OUTPUT"
+            echo "无该版本补丁集（${VERSION}），需人工 rebase；blocked-issue 接管"
+          fi
 
       - name: 恢复 ISO 缓存（按版本 key；命中则跳过下载，纯恢复无 post 存）
         id: iso-cache
-        if: needs.detect.outputs.version != 'manual'
+        if: env.BRANCH == 'iso' && needs.detect.outputs.version != 'manual'
         uses: actions/cache/restore@v4
         with:
           path: /tmp/fnos.iso
@@ -139,6 +197,7 @@ jobs:
           restore-keys: fnos-iso-
 
       - name: 下载官方 ISO（含官网 hash 校验，坏缓存当场重下）
+        if: env.BRANCH == 'iso'
         run: |
           if [ "${{ steps.iso-cache.outputs.cache-hit }}" != "true" ]; then
             curl -fL --retry 3 -o /tmp/fnos.iso.downloading "${{ needs.detect.outputs.iso_url }}"
@@ -167,19 +226,53 @@ jobs:
           fi
 
       - name: 即刻存 ISO 缓存（不等 job 结束；后段失败也不白下）
-        if: steps.iso-cache.outputs.cache-hit != 'true'
+        if: env.BRANCH == 'iso' && steps.iso-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /tmp/fnos.iso
           key: fnos-iso-${{ needs.detect.outputs.version }}
 
-      - name: extract 出厂 rootfs
+      - name: ISO 头 extract 出厂 rootfs（FAN-IN 前半段二选一）
+        if: env.BRANCH == 'iso'
         run: |
           sudo python3 toolchain/fnos_iso.py extract /tmp/fnos.iso "$RUNNER_TEMP/factory"
           rm -f /tmp/fnos.iso
 
+      - name: deb 头物化 rootfs（底座 export + 清理 + .deb 覆盖 + 版本戳）
+        if: env.BRANCH == 'deb'
+        run: |
+          base="${{ needs.detect.outputs.base_tag }}"
+          [ -n "$base" ] || { echo "无可用底座（Hub 上无低于 $VERSION 的 tag），等 ISO 版先出"; exit 1; }
+          cid=$(docker create "${DOCKERHUB_REPO}:$base")
+          sudo mkdir -p "$RUNNER_TEMP/factory"
+          docker export "$cid" | sudo tar -x -C "$RUNNER_TEMP/factory"
+          docker rm "$cid"
+          # 运行时清理（D9 清单）：身份与日志残留去干净，machine-id 由推送步重建
+          sudo rm -f "$RUNNER_TEMP/factory/etc/machine-id" \
+            "$RUNNER_TEMP/factory/etc/hostname" "$RUNNER_TEMP/factory/.dockerenv"
+          sudo rm -rf "$RUNNER_TEMP/factory/var/log/"* "$RUNNER_TEMP/factory/tmp/"* \
+            "$RUNNER_TEMP/factory/run/"*
+          [ -e "$RUNNER_TEMP/factory/etc/machine-id" ] && { echo "清理漏项：machine-id 仍在"; exit 1; }
+          [ -e "$RUNNER_TEMP/factory/.dockerenv" ] && { echo "清理漏项：/.dockerenv 仍在"; exit 1; }
+          # .deb 包组现签现下（sha256==manifest sign 逐包校验，失败即停）
+          python3 toolchain/fetch-ota-debs.py --version "$VERSION" --out /tmp/debs
+          # B 文件覆盖法：只解 data 内容覆盖，不跑 dpkg 库与 pre/post（构建期无
+          # systemd/postgres/grub；容器内 dpkg -l 版本从此不可信，以文件 hash 为准）
+          for d in /tmp/debs/*.deb; do
+            echo "overlay: $(basename "$d")"
+            dpkg-deb --fsys-tarfile "$d" | sudo tar -x -C "$RUNNER_TEMP/factory"
+          done
+          rm -rf /tmp/debs
+          # 手工版本戳（.deb 不含它；fnos_patch 版本锚点必需）
+          echo "$VERSION" | sudo tee "$RUNNER_TEMP/factory/usr/trim/etc/version" >/dev/null
+          [ "$(sudo cat "$RUNNER_TEMP/factory/usr/trim/etc/version")" = "$VERSION" ] \
+            || { echo "版本戳写入失败"; exit 1; }
+
+      # ---- FAN-IN：以下尾巴两分支一字不差，共用同一份实现 ----
+
       - name: aobpatch check（失败即停，不写半成品）
         id: check
+        if: steps.patchset-gate.outputs.patchset == 'ok'
         run: |
           ver="$VERSION"
           sudo python3 toolchain/aobpatch.py check \
@@ -189,7 +282,7 @@ jobs:
           cat "$RUNNER_TEMP/patch-report.json"
 
       - name: patch apply + mkraw + fsck
-        if: steps.check.outcome == 'success'
+        if: steps.patchset-gate.outputs.patchset == 'ok' && steps.check.outcome == 'success'
         run: |
           sudo python3 toolchain/fnos_patch.py apply --rootfs "$RUNNER_TEMP/factory"
           sudo python3 toolchain/fnos_image.py mkraw "$RUNNER_TEMP/factory" "$RUNNER_TEMP/image.raw" 12 --fs=ext4
@@ -197,17 +290,18 @@ jobs:
             --patchset="toolchain/patches/fnos-${VERSION#V}.json"
 
       - name: 校验 nfs-server mask 在位（宿主内核态防护，单元名与 fnos_patch.py MASK_UNITS 保持一致）
+        if: steps.patchset-gate.outputs.patchset == 'ok'
         run: |
           link="$RUNNER_TEMP/factory/etc/systemd/system/nfs-server.service"
           [ -L "$link" ] || { echo "mask 缺失：$link 不是符号链接"; exit 1; }
           [ "$(readlink "$link")" = "/dev/null" ] || { echo "mask 目标错误：$(readlink "$link")"; exit 1; }
           echo "nfs-server 已 mask"
 
-      - name: docker import + 双标签推送
-        if: steps.check.outcome == 'success'
+      - name: "docker import + 参数化推送（ISO: tag+latest；deb: X-ota 永不 latest）"
+        if: steps.patchset-gate.outputs.patchset == 'ok' && steps.check.outcome == 'success'
         run: |
           echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USER }}" --password-stdin
-          ver="$VERSION"
+          ver="$VERSION"; tag="$TAG"
           # 容器运行必需（fnos_patch 不管这两项）：有效 machine-id + /run 骨架
           [ -s "$RUNNER_TEMP/factory/etc/machine-id" ] || \
             python3 -c "import uuid; print(uuid.uuid4().hex)" | sudo tee "$RUNNER_TEMP/factory/etc/machine-id" >/dev/null
@@ -216,22 +310,31 @@ jobs:
             --change 'ENTRYPOINT ["/lib/systemd/systemd"]' \
             --change 'ENV container=docker' \
             --change 'CMD ["log-level=info"]' \
-            - "${DOCKERHUB_REPO}:$ver"
-          docker tag "${DOCKERHUB_REPO}:$ver" "${DOCKERHUB_REPO}:latest"
-          docker push "${DOCKERHUB_REPO}:$ver"
-          docker push "${DOCKERHUB_REPO}:latest"
+            - "${DOCKERHUB_REPO}:$tag"
+          docker push "${DOCKERHUB_REPO}:$tag"
+          if [ "${{ needs.detect.outputs.move_latest }}" = "true" ]; then
+            docker tag "${DOCKERHUB_REPO}:$tag" "${DOCKERHUB_REPO}:latest"
+            docker push "${DOCKERHUB_REPO}:latest"
+          else
+            echo "move_latest=false：latest 保持不动（deb/手动分支）"
+          fi
+
+      - name: 无补丁集显式失败（blocked-issue 接管，等人工 rebase）
+        if: steps.patchset-gate.outputs.patchset == 'missing'
+        run: |
+          echo "patchset for $VERSION missing, needs manual rebase"; exit 1
 
       - name: 上传可读报告（含失败）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: patch-report-${{ env.VERSION }}
+          name: patch-report-${{ env.TAG }}
           path: ${{ runner.temp }}/patch-report.json
           if-no-files-found: warn
 
   open-issue:
-    needs: [detect, selfcheck]
-    if: failure() && needs.selfcheck.result == 'failure'
+    needs: [detect, build]
+    if: failure() && needs.build.result == 'failure' && needs.build.outputs.patchset == 'ok'
     runs-on: ubuntu-22.04
     permissions:
       issues: write
@@ -239,37 +342,51 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          name: patch-report-${{ needs.detect.outputs.version }}
+          name: patch-report-${{ needs.detect.outputs.tag }}
           path: /tmp/report
-      - name: 补丁失效开 Issue（含 per-site 报告）
+      - name: 补丁失效开 Issue（含 per-site 报告；标题按分支区分 X / X-ota）
         run: |
           body=$(python3 -c "
-          import json
-          d = json.load(open('/tmp/report/patch-report.json'))
-          items = d.get('items') or d.get('patches') or []
-          bad = [i for i in items if str(i.get('status','')) not in ('already','ready','applied','ok')]
-          lines = ['patchset missed on new ISO: %d/%d ok.' % (len(items)-len(bad), len(items)), '']
-          lines += ['- %s -> %s' % (i.get('id'), i.get('status')) for i in bad]
-          print('\n'.join(lines))
+          import json, os
+          p = '/tmp/report/patch-report.json'
+          if not os.path.isfile(p):
+              print('build failed after patchset gate (overlay/import/push stage), no per-site report. tag=${{ needs.detect.outputs.tag }} branch=${{ needs.detect.outputs.branch }}.')
+          else:
+              d = json.load(open(p))
+              items = d.get('items') or d.get('patches') or []
+              bad = [i for i in items if str(i.get('status','')) not in ('already','ready','applied','ok')]
+              lines = ['patchset missed on new rootfs: %d/%d ok.' % (len(items)-len(bad), len(items)), '']
+              lines += ['- %s -> %s' % (i.get('id'), i.get('status')) for i in bad]
+              print('\n'.join(lines))
           ")
-          gh issue create --title "patchset miss ${{ needs.detect.outputs.version }} $(date -u +%F)" --body "$body"
+          gh issue create --title "patchset miss ${{ needs.detect.outputs.tag }} $(date -u +%F)" --body "$body"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   blocked-issue:
-    needs: detect
-    if: needs.detect.outputs.build == 'yes' && needs.detect.outputs.downloadable == 'no'
+    needs: [detect, build]
+    if: always() && (needs.detect.outputs.build == 'yes' && needs.detect.outputs.downloadable == 'no' || needs.build.outputs.patchset == 'missing')
     runs-on: ubuntu-22.04
     permissions:
       issues: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: 直链被拦开 Issue
+      - name: 直链被拦开 Issue（仅 ISO 分支）
+        if: needs.detect.outputs.downloadable == 'no'
         run: |
-          gh issue create --title "ISO download blocked ${{ needs.detect.outputs.version }} $(date -u +%F)" \
-            --body "新版 ${{ needs.detect.outputs.version }} 已发现，但直链下载被拦截（CDN 403）。需人工提供可用的 ISO 来源后手动触发构建。"
+          gh issue create --title "ISO download blocked ${{ needs.detect.outputs.tag }} $(date -u +%F)" \
+            --body "新版 ${{ needs.detect.outputs.tag }} 已发现，但直链下载被拦截（CDN 403）。需人工提供可用的 ISO 来源后手动触发构建。"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 无补丁集开 Issue（需人工 rebase；标题按分支区分 X / X-ota）
+        if: needs.build.outputs.patchset == 'missing'
+        run: |
+          gh issue create --title "patchset missing ${{ needs.detect.outputs.tag }} (needs rebase) $(date -u +%F)" \
+            --body "目标 ${{ needs.detect.outputs.tag }}（分支 ${{ needs.detect.outputs.branch }}）无可用补丁集。需人工 rebase 出新补丁集后手动重触发。若 deb 分支同时缺底座（无低于目标版本的 Hub tag），先等对应 ISO 版构建发布。"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -289,32 +406,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  ota-watch:
-    needs: detect
-    if: needs.detect.result == 'success' && needs.detect.outputs.ota_newer == 'true'
-    runs-on: ubuntu-22.04
-    permissions:
-      issues: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: OTA 领先预警（有新版、无 ISO，不触发构建）
-        run: |
-          over="${{ needs.detect.outputs.ota_version }}"
-          page="${{ needs.detect.outputs.version }}"
-          title="OTA early warning: $over (ISO not yet listed)"
-          # 幂等：同标题 open Issue 已存在则不再开
-          n=$(gh issue list --state open --search "$title in:title" --json number --jq length)
-          if [ "$n" = "0" ]; then
-            gh issue create --title "$title" --body "OTA 清单已见 trim $over，但下载页仍是 $page（无 ISO 不可构建）。rebase 预热窗口；ISO 上架后本 Issue 可关闭。"
-          else
-            echo "预警 Issue 已存在，跳过"
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   release:
-    needs: selfcheck
+    needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
