@@ -3,6 +3,10 @@
 #
 # 用法: sudo bash stor-manage.sh create|up|destroy|status|register|unregister
 #
+# 数据安全：destroy 前检查卷上应用数据（@appmeta/用户目录/appcenter 记录），
+#   有数据时默认拒绝，需 CONFIRM_DESTROY=YES 显式确认；先按提示 tar 备份再删。
+#   容器未运行或 DB 不可达时按"有数据"处理（fail-closed）。
+#
 # 方案链路（已在 CT200 实测通过）：
 #   zvol ──nvmet──▶ nvme-loop ──▶ /dev/nvmeXnY（对 fnOS 表现为物理盘，有 /sys/block/<dev>/device）
 #        └─ partition ─ md(raid1单盘, llbitmap) ─ VG trim_<uuid> ─ LV 0 ─ ext4(+prjquota)
@@ -29,7 +33,7 @@ STATE_DIR="${STATE_DIR:-/var/lib/fnos-stor}"
 STATE="$STATE_DIR/ct${CTID}.env"
 VOLSTORE="${VOLSTORE:-}"
 VOLNAME="${VOLNAME:-vm-${CTID}-disk-1}"
-VOLSIZE="${VOLSIZE:-16}"                      # GiB
+VOLSIZE="${VOLSIZE:-25}"                      # GiB（默认 25G：16G 基础够用，相册 AI 需要更大）
 VOLFS="${VOLFS:-ext4}"                        # ext4 | btrfs | zfs（fnOS 三种都认）
 DEVID="${DEVID:-2}"                           # devN 序号
 NQN="${NQN:-nqn.2026-10.io.fnos:vol${CTID}}"
@@ -279,6 +283,29 @@ do_unregister() {
   log "反登记 uuid=${VG}-0 / ${VG}"
 }
 
+# ---------- 6b) 应用元数据目录补齐（卷重建后应用可启动）----------
+# /volN/@appmeta/<app> 在卷重建后丢失会导致后端启动失败（如 trim.photos 因
+# meta 软链接悬空而 mkdir panic）。按 appcenter.app 的 app_name 补建缺失目录
+# （root:700，照抄 trim.media 存量约定）。只建目录，不碰应用文件与 DB。
+ensure_appmeta() {
+  load_state
+  local vol="/vol${DEVID:-2}" apps a
+  apps="$(pct exec "$CTID" -- sh -c "sudo -u postgres psql -d appcenter -t -c 'select app_name from app' 2>/dev/null" || true)"
+  [ -n "$apps" ] || { log "appcenter 不可达或无已安装应用，跳过 @appmeta 补齐"; return 0; }
+  for a in $apps; do
+    a="$(echo "$a" | tr -d ' ')"
+    [ -n "$a" ] || continue
+    if pct exec "$CTID" -- sh -c "test -e '$vol/@appmeta/$a'" 2>/dev/null; then
+      continue
+    fi
+    if pct exec "$CTID" -- sh -c "mkdir -p '$vol/@appmeta/$a' && chmod 700 '$vol/@appmeta/$a'" 2>/dev/null; then
+      log "补建 $vol/@appmeta/$a"
+    else
+      log "补建 $vol/@appmeta/$a 失败（$vol 未挂载？）"
+    fi
+  done
+}
+
 # ---------- 7) 开机自愈 unit ----------
 ensure_unit() {
   cat > "$UNIT" <<EOF
@@ -302,7 +329,7 @@ do_create() {
   need_root; need_py; need_ct
   load_state
   log "== stor-manage create (CT$CTID) =="
-  ensure_zvol; ensure_nvme; ensure_stack; ensure_passthrough; ensure_mask; ensure_zfs_mount; do_register; ensure_unit
+  ensure_zvol; ensure_nvme; ensure_stack; ensure_passthrough; ensure_mask; ensure_zfs_mount; do_register; ensure_appmeta; ensure_unit
   manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"create","ctid":%s,"vg":"%s","md":"%s","lv":"%s"}' "$(date -Is)" "$CTID" "${VG:-}" "${MD_DEV:-}" "${DM_DEV:-}")"
   log "create 完成；重启容器生效：pct reboot $CTID"
 }
@@ -315,10 +342,61 @@ do_up() {   # 自愈：确保 zvol/nvme/栈/屏蔽/透传 都在（幂等）
   ensure_mask  || true
   log "up 完成"
 }
+# ---------- 0) destroy 护栏：卷上有应用数据时默认拒绝 ----------
+# 检查信号（任一命中即视为有数据）：
+#   容器运行时：/volN/@appmeta 非空，或 /volN 下有数字 uid 目录，或 appcenter.app 有记录；
+#   容器未运行时：宿主侧 ro 挂载 LV 检查（只读，不污染）；
+#   都查不到 → fail-closed（视为有数据）。
+# 有数据且 CONFIRM_DESTROY != YES → 拒绝并打印备份命令。
+# 返回 0=有数据（并 echo 原因），1=确认干净。
+destroy_has_appdata() {
+  local vol="/vol${DEVID:-2}" out n
+  if pct status "$CTID" 2>/dev/null | grep -q running; then
+    out="$(pct exec "$CTID" -- sh -c "ls -A $vol/@appmeta 2>/dev/null" || true)"
+    [ -n "$out" ] && { echo "$vol/@appmeta 非空"; return 0; }
+    out="$(pct exec "$CTID" -- sh -c "ls -d $vol/[0-9]* 2>/dev/null" || true)"
+    [ -n "$out" ] && { echo "$vol 下有用户目录"; return 0; }
+    n="$(pct exec "$CTID" -- sh -c "sudo -u postgres psql -d appcenter -t -c 'select count(*) from app' 2>/dev/null" | tr -d ' ' || echo err)"
+    [ "$n" = err ] && { echo "appcenter DB 不可达"; return 0; }
+    case "$n" in ''|*[!0-9]*) echo "appcenter DB 返回异常"; return 0;; esac
+    [ "$n" -gt 0 ] && { echo "appcenter.app 有 $n 条记录"; return 0; }
+    return 1
+  fi
+  # 容器未运行：宿主侧 ro 挂载检查
+  local dev="${DM_DEV:-}"
+  [ -b "$dev" ] || { echo "LV 设备不存在，无法检查"; return 0; }
+  local mnt; mnt="$(mktemp -d)"
+  if mount -o ro "$dev" "$mnt" 2>/dev/null; then
+    local r=1
+    [ -n "$(ls -A "$mnt/@appmeta" 2>/dev/null)" ] && { echo "@appmeta 非空"; r=0; }
+    [ "$r" = 1 ] && [ -n "$(ls -d "$mnt"/[0-9]* 2>/dev/null)" ] && { echo "卷上有用户目录"; r=0; }
+    umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true
+    return $r
+  fi
+  rmdir "$mnt" 2>/dev/null || true
+  echo "宿主侧 ro 挂载失败，无法检查"
+  return 0
+}
+
 do_destroy() {
   need_root
   load_state
   log "== stor-manage destroy (CT$CTID) =="
+  local dreason
+  if dreason="$(destroy_has_appdata)"; then
+    if [ "${CONFIRM_DESTROY:-}" != "YES" ]; then
+      manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"destroy-refused","ctid":%s,"reason":"%s"}' "$(date -Is)" "$CTID" "$dreason")"
+      cat >&2 <<EOF
+拒绝：卷上可能有应用数据（${dreason}），destroy 会格式化整个卷。
+先备份（示例，容器运行时）：
+  sudo -n pct exec $CTID -- tar czf - -C /vol${DEVID:-2} @appmeta 1000 2>/dev/null > ~/vol-appdata-${CTID}.tgz
+确认要删则重跑并显式确认：
+  sudo -n env CTID=$CTID VOLSTORE=${VOLSTORE:-} CONFIRM_DESTROY=YES bash $0 destroy
+EOF
+      exit 2
+    fi
+    log "已显式确认销毁有数据的卷（${dreason}）"
+  fi
   do_unregister 2>/dev/null || true
   systemctl disable --now "fnos-stor-ct${CTID}.service" >/dev/null 2>&1 || true; rm -f "$UNIT"; systemctl daemon-reload 2>/dev/null || true
   DEVS="${NVME_DEV:-}" bash "$SCRIPT_DIR/stor-mask.sh" rollback >/dev/null 2>&1 || true
@@ -353,7 +431,7 @@ do_destroy() {
     cat "$t" > "$C"; rm -f "$t"
   fi
   rm -f "$STATE"
-  manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"destroy","ctid":%s}' "$(date -Is)" "$CTID")"
+  manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"destroy","ctid":%s,"confirm":"%s"}' "$(date -Is)" "$CTID" "${CONFIRM_DESTROY:-no}")"
   log "destroy 完成"
 }
 do_status() {

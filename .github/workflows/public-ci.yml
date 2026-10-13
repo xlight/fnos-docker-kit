@@ -188,6 +188,13 @@ jobs:
           sudo python3 toolchain/fnos_image.py check "$RUNNER_TEMP/image.raw" \
             --patchset="toolchain/patches/fnos-${VERSION#V}.json"
 
+      - name: 校验 nfs-server mask 在位（宿主内核态防护，单元名与 fnos_patch.py MASK_UNITS 保持一致）
+        run: |
+          link="$RUNNER_TEMP/factory/etc/systemd/system/nfs-server.service"
+          [ -L "$link" ] || { echo "mask 缺失：$link 不是符号链接"; exit 1; }
+          [ "$(readlink "$link")" = "/dev/null" ] || { echo "mask 目标错误：$(readlink "$link")"; exit 1; }
+          echo "nfs-server 已 mask"
+
       - name: docker import + 双标签推送
         if: steps.check.outcome == 'success'
         run: |

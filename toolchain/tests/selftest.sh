@@ -38,9 +38,11 @@ no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 [ -d "$WWW_FIXTURE" ] || { echo "缺少 www fixture：在 toolchain 目录先 sudo python3 fnos_iso.py extract <官方ISO> <destdir>，再 WWW_FIXTURE=<destdir>/usr/trim 重跑"; exit 2; }
 
 # ---- fixture 守卫：对每个有 file_hashes 的文件断言 == 声明的 orig ----
+# + 对 usr/trim/bin/ 下的文件断言 owner 可执行位（.so 不断言：库文件 644 合法）。
+# 事故教训：orig/filemanager 曾以 644 入库，hash 全对但 file.* 全部 hanging。
 fixture_check() {
   $PY - "$PATCHSET" "$FIXTURE" <<'PYEOF'
-import json, sys, hashlib, os
+import json, sys, hashlib, os, stat
 ps = json.load(open(sys.argv[1])); fx = sys.argv[2]
 fh = ps.get("file_hashes") or {}
 bad = []
@@ -51,12 +53,14 @@ for f, h in fh.items():
     got = hashlib.sha256(open(p, "rb").read()).hexdigest()
     if got != h["orig"]:
         bad.append((b, h["orig"], got))
+    if f.startswith("usr/trim/bin/") and not (os.stat(p).st_mode & stat.S_IXUSR):
+        bad.append((b, "mode=755(可执行)", "mode=%o(不可执行)" % (stat.S_IMODE(os.stat(p).st_mode))))
 if bad:
     print("FIXTURE DRIFT (%s):" % fx, file=sys.stderr)
     for b, want, got in bad:
         print("  %-18s want(orig)=%s got=%s" % (b, want, got), file=sys.stderr)
     sys.exit(1)
-print("fixture ok: %d 个二进制 == file_hashes.orig" % len(fh))
+print("fixture ok: %d 个二进制 == file_hashes.orig（含 bin 可执行位）" % len(fh))
 PYEOF
 }
 

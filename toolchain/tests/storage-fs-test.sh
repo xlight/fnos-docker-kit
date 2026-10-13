@@ -20,7 +20,7 @@ no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 test_fs() {
   local fs="$1"
   echo "===== 存储卷 fs=$fs (CT$CTID) ====="
-  CTID="$CTID" VOLFS="$fs" VOLSTORE="$VOLSTORE" bash "$SM" destroy >/dev/null 2>&1 || true
+  CTID="$CTID" VOLFS="$fs" VOLSTORE="$VOLSTORE" CONFIRM_DESTROY=YES bash "$SM" destroy >/dev/null 2>&1 || true
   # destroy 会停容器；create 需要容器 running
   pct start "$CTID" >/dev/null 2>&1 || true
   local i
@@ -39,7 +39,7 @@ test_fs() {
 test_fs btrfs
 test_fs zfs
 echo "===== 恢复 ext4 ====="
-CTID="$CTID" VOLFS=ext4 VOLSTORE="$VOLSTORE" bash "$SM" destroy >/dev/null 2>&1 || true
+CTID="$CTID" VOLFS=ext4 VOLSTORE="$VOLSTORE" CONFIRM_DESTROY=YES bash "$SM" destroy >/dev/null 2>&1 || true
 CTID="$CTID" VOLFS=ext4 VOLSTORE="$VOLSTORE" bash "$SM" create >/dev/null 2>&1 && \
   pct reboot "$CTID" >/dev/null 2>&1 || true
 

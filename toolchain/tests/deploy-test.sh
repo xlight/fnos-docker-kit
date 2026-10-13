@@ -34,7 +34,7 @@ no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 echo "########## 0) 清理旧 CT$CTID ##########"
 pct stop "$CTID" >/dev/null 2>&1 || true
 pct destroy "$CTID" >/dev/null 2>&1 || true
-CTID="$CTID" VOLSTORE="$VOLSTORE" bash "$SM" destroy >/dev/null 2>&1 || true
+CTID="$CTID" VOLSTORE="$VOLSTORE" CONFIRM_DESTROY=YES bash "$SM" destroy >/dev/null 2>&1 || true
 pvesm free "${STORAGE}:${CTID}/vm-${CTID}-disk-0.raw" >/dev/null 2>&1 || true
 
 echo "########## 7.1 安装镜像为容器 ##########"
@@ -65,7 +65,7 @@ CTID="$CTID" VOLFS="$VOLFS" VOLSTORE="$VOLSTORE" bash "$SM" create >/dev/null 2>
 bash "$DEP" smoke "$CTID" >/dev/null 2>&1 && ok "幂等后仍可用" || no "幂等后不可用"
 
 echo "########## 8.2 回撤 ##########"
-CTID="$CTID" VOLSTORE="$VOLSTORE" bash "$SM" destroy >/dev/null 2>&1 || true
+CTID="$CTID" VOLSTORE="$VOLSTORE" CONFIRM_DESTROY=YES bash "$SM" destroy >/dev/null 2>&1 || true
 bash "$DEP" uninstall "$CTID" --storage "$STORAGE" >/dev/null 2>&1 \
   && ok "uninstall 完成" || no "uninstall"
 pct status "$CTID" >/dev/null 2>&1 && no "容器未移除" || ok "容器已移除"

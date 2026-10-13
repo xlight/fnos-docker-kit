@@ -356,6 +356,36 @@ print("ALL" if ok else "SOME")' 2>/dev/null || echo "$(printf 'FAIL\terr\nSOME')
     echo "  SKIP: memview 机制不在本树（公开裁剪），跳过本节"
   fi
 
+  echo "== [11] 文件管理读通路（file.ls RPC 只读探针） =="
+  if [ -z "${FNOS_PASS:-}" ]; then
+    echo "  SKIP: 未设 FNOS_PASS（需 fnOS 账号口令），跳过本节"
+  else
+    _fhost="$(pct exec "$id" -- sh -c 'hostname -I 2>/dev/null' | tr ' ' '\n' | grep -m1 -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+    _fvol="$(pct exec "$id" -- sh -c 'findmnt -rno TARGET 2>/dev/null' | grep -m1 -E '^/vol[0-9]+' || true)"
+    if [ -z "$_fhost" ] || [ -z "$_fvol" ]; then
+      echo "  SKIP: 取不到容器 IP 或 /volN（host=${_fhost:-?} vol=${_fvol:-?}），跳过本节"
+    else
+      _fpath="${_fvol#/}"
+      _fls="$(FNOS_HOST="$_fhost" FNOS_USER="${FNOS_USER:-xlight}" FNOS_PASS="$FNOS_PASS" FNOS_TIMEOUT=60 FNOS_PROBES="[{\"req\":\"file.ls\",\"params\":{\"path\":\"$_fpath\"}}]" python3 "$tc_dir/../scripts/fnos_rpc.py" 2>/dev/null | grep -m1 '^RESULT ' || true)"
+      _fok="$(echo "$_fls" | python3 -c 'import sys,json
+try:
+    r=json.loads(sys.stdin.read()[7:]); f=(r.get("resp") or {}).get("files")
+    print(1 if isinstance(f,list) else 0)
+except Exception: print(0)')"
+      chk "file.ls 返回 files 数组 (vol=$_fvol)" "$_fok"
+    fi
+  fi
+
+  echo "== [12] 容器内 docker（仅 data-root 已配置时断言） =="
+  _droot="$(pct exec "$id" -- cat /usr/trim/etc/dockermgr.conf 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("data-root",""))' 2>/dev/null || true)"
+  if [ -z "$_droot" ] || [ "$_droot" = "0" ]; then
+    echo "  INFO: docker 未配置（data-root 未设），跳过本节"
+  else
+    _da="$(pct exec "$id" -- systemctl is-active docker 2>/dev/null || echo '')"
+    chk "docker active (data-root=$_droot, =$_da)" "$([ "$_da" = active ] && echo 1 || echo 0)"
+    pct exec "$id" -- docker ps >/dev/null 2>&1 && chk "docker ps 可连" 1 || chk "docker ps 可连" 0
+  fi
+
   echo
   [ "$ok" = 1 ] && echo "SMOKE: PASS" || echo "SMOKE: FAIL"
   return $(( 1 - ok ))

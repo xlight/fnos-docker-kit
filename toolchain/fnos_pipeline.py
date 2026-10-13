@@ -245,7 +245,9 @@ def do_rollback(a):
         return 2
     sm = os.path.join(a.script_dir, "stor-manage.sh")
     log("回退：专属存储")
-    run(["bash", sm, "destroy"], env_extra={"CTID": a.ctid, "VOLSTORE": a.volstore})
+    run(["bash", sm, "destroy"], env_extra={"CTID": a.ctid, "VOLSTORE": a.volstore,
+                                           # rollback 本身就是显式的销毁意图，等价于确认
+                                           "CONFIRM_DESTROY": "YES"})
     log("回退：容器与 rootfs 卷")
     rc = run(["bash", os.path.join(TC, "fnos_deploy.sh"), "uninstall", str(a.ctid),
               "--storage", a.storage])
