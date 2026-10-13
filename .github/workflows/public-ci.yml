@@ -236,6 +236,8 @@ jobs:
     permissions:
       issues: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: patch-report-${{ needs.detect.outputs.version }}
@@ -262,6 +264,8 @@ jobs:
     permissions:
       issues: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: 直链被拦开 Issue
         run: |
           gh issue create --title "ISO download blocked ${{ needs.detect.outputs.version }} $(date -u +%F)" \
@@ -276,6 +280,8 @@ jobs:
     permissions:
       issues: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: 检测故障开 Issue
         run: |
           gh issue create --title "ISO detector failed $(date -u +%F)" \
@@ -290,6 +296,8 @@ jobs:
     permissions:
       issues: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: OTA 领先预警（有新版、无 ISO，不触发构建）
         run: |
           over="${{ needs.detect.outputs.ota_version }}"
