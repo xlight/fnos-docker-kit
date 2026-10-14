@@ -258,9 +258,14 @@ jobs:
           python3 toolchain/fetch-ota-debs.py --version "$VERSION" --out /tmp/debs
           # B 文件覆盖法：只解 data 内容覆盖，不跑 dpkg 库与 pre/post（构建期无
           # systemd/postgres/grub；容器内 dpkg -l 版本从此不可信，以文件 hash 为准）
+          # --keep-directory-symlink 必备（不是 -k：-k 含 --keep-old-files 会拒绝覆盖
+          # 已有文件）：底座是 usrmerge 布局（lib->usr/lib），.deb 内是 ./lib/ 真实
+          # 目录项；无此旗标 tar 会把链接替换成实目录，1950+ 库被影子目录遮蔽，
+          # /sbin/init 与 /lib/systemd/systemd 全 dangling（2026-10-14 本地实测，
+          # 与 toolchain/fnos_pipeline.py stage_overlay 同义，注释互引）
           for d in /tmp/debs/*.deb; do
             echo "overlay: $(basename "$d")"
-            dpkg-deb --fsys-tarfile "$d" | sudo tar -x -C "$RUNNER_TEMP/factory"
+            dpkg-deb --fsys-tarfile "$d" | sudo tar -x --keep-directory-symlink -C "$RUNNER_TEMP/factory"
           done
           rm -rf /tmp/debs
           # 手工版本戳（.deb 不含它；fnos_patch 版本锚点必需）
