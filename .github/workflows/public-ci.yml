@@ -284,7 +284,9 @@ jobs:
       - name: patch apply + mkraw + fsck
         if: steps.patchset-gate.outputs.patchset == 'ok' && steps.check.outcome == 'success'
         run: |
-          sudo python3 toolchain/fnos_patch.py apply --rootfs "$RUNNER_TEMP/factory"
+          # fnos_patch 的 --patches 缺省写死 0701，必须显式传版本补丁集（否则版本锚点拒装）
+          sudo python3 toolchain/fnos_patch.py apply --rootfs "$RUNNER_TEMP/factory" \
+            --patches "toolchain/patches/fnos-${VERSION#V}.json"
           sudo python3 toolchain/fnos_image.py mkraw "$RUNNER_TEMP/factory" "$RUNNER_TEMP/image.raw" 12 --fs=ext4
           sudo python3 toolchain/fnos_image.py check "$RUNNER_TEMP/image.raw" \
             --patchset="toolchain/patches/fnos-${VERSION#V}.json"
