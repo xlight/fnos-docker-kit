@@ -26,7 +26,10 @@ TC="$(dirname "$HERE")"
 PY="${PYTHON:-python3}"
 FIXTURE="${FIXTURE:-}"
 WWW_FIXTURE="${WWW_FIXTURE:-}"
-PATCHSET="$TC/patches/fnos-1.2.0701.json"
+PATCHSET="${PATCHSET:-$(ls "$TC"/patches/fnos-*.json 2>/dev/null | grep -v '\.bak' | sort -V | tail -1)}"
+# fixture 版本戳跟随 PATCHSET（fnos-local-deb-head D2：测试输入也不写死旧版本；
+# 二进制/www fixture 与补丁集的一致性由 fixture 守卫强制，有漂移即明确中止）
+PATCHSET_VER="$("$PY" -c "import json,sys; print(json.load(open('$PATCHSET')).get('fnos_version','').lstrip('Vv'))")"
 W="$(mktemp -d /tmp/opencode/fnos-selftest.XXXXXX)"
 pass=0; fail=0
 ok(){ echo "  PASS: $1"; pass=$((pass+1)); }
@@ -98,7 +101,7 @@ mk_tree() {
   cp "$WWW_FIXTURE"/www/assets/index-*.js "$t/usr/trim/www/assets/"
   cp "$WWW_FIXTURE/share/.restore/www.zip"  "$t/usr/trim/share/.restore/"
   printf 'UUID=aaaa / ext4 defaults 0 1\ntrimafs /fs trimafs defaults 0 0\n' > "$t/etc/fstab"
-  echo "1.2.0701" > "$t/usr/trim/etc/version"
+  echo "$PATCHSET_VER" > "$t/usr/trim/etc/version"
 }
 
 snap() { for f in "$1"/usr/trim/lib/*.so "$1"/usr/trim/bin/*; do sha256sum "$f"; done; }

@@ -4,7 +4,7 @@
 #
 # 子命令（需 root）：
 #   build   把出厂 rootfs 打成镜像并产出验证物
-#     --rootfs <dir> --out <dir> [--version V1.2.0701] [--fs ext4|btrfs] [--size 12]
+#     --rootfs <dir> --out <dir> [--version V1.2.0800] [--fs ext4|btrfs] [--size 12]
 #     [--vztmpl] [--zfs <pool/dataset>] [--skip-patch] [--no-version-check]
 #   verify  对一个已有镜像做自检 + 指纹 + 验证报告（5.1/5.3/5.4）
 #     --image <img> --out <dir> [--rootfs <dir>] [--patchset <json>]
@@ -31,7 +31,6 @@ import fnos_image  # noqa: E402
 import fnos_patch  # noqa: E402
 
 TC = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_PS = os.path.join(TC, "patches", "fnos-1.2.0701.json")
 
 
 def sha256_file(path):
@@ -74,8 +73,12 @@ def now():
 
 
 # ---------------------------------------------------------------------- verify
-def cmd_verify(image, out, rootfs=None, patchset=DEFAULT_PS):
+def cmd_verify(image, out, rootfs=None, patchset=None):
     os.makedirs(out, exist_ok=True)
+    if not patchset:
+        if not rootfs:
+            raise RuntimeError("verify 缺补丁集：请显式 patchset（或给 rootfs 以自动选择）")
+        patchset = fnos_patch.resolve_patchset(rootfs, None)
     ps = json.load(open(patchset))
     checks = []
     fps = {}
@@ -168,6 +171,18 @@ def run_smoke(ctid, image):
 def cmd_build(a):
     out = a.out
     os.makedirs(out, exist_ok=True)
+    # 版本缺省永不指向旧版本（fnos-local-deb-head D2）：随 rootfs 推导，找不到就炸。
+    if not a.version:
+        got = fnos_patch.read_rootfs_version(a.rootfs) if a.rootfs else None
+        if not got:
+            print("ERROR: 读不到版本（--rootfs 无版本戳），请显式 --version", file=sys.stderr)
+            return 2
+        a.version = "V" + got.lstrip("Vv")
+    try:
+        a.patchset = fnos_patch.resolve_patchset(a.rootfs, a.patchset)
+    except RuntimeError as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        return 2
     # 1) 打补丁（烘进 rootfs）
     if not a.skip_patch:
         for line in fnos_patch.apply(a.rootfs, a.patchset, a.mount_shim,
@@ -282,12 +297,14 @@ def main():
     b = sub.add_parser("build")
     b.add_argument("--rootfs", required=True)
     b.add_argument("--out", required=True)
-    b.add_argument("--version", default="V1.2.0701")
+    b.add_argument("--version", default=None,
+                     help="fnOS 版本；缺省读 --rootfs 版本戳，读不到则必填报错")
     b.add_argument("--fs", default="ext4", choices=["ext4", "btrfs"])
     b.add_argument("--size", default=12)
     b.add_argument("--vztmpl", action="store_true")
     b.add_argument("--zfs")
-    b.add_argument("--patchset", default=DEFAULT_PS)
+    b.add_argument("--patchset", default=None,
+                     help="补丁集路径；缺省按 rootfs 版本自动选择（找不到则失败，永不默认旧版本）")
     b.add_argument("--mount-shim", default=os.path.normpath(os.path.join(TC, "..", "scripts", "stor-mount-shim.sh")))
     b.add_argument("--skip-patch", action="store_true")
     b.add_argument("--no-version-check", action="store_true")
@@ -298,7 +315,8 @@ def main():
     v.add_argument("--image", required=True)
     v.add_argument("--out", required=True)
     v.add_argument("--rootfs")
-    v.add_argument("--patchset", default=DEFAULT_PS)
+    v.add_argument("--patchset", default=None,
+                     help="补丁集路径；缺省按 --rootfs 版本自动选择")
 
     r = sub.add_parser("release")
     r.add_argument("--out", required=True)
@@ -310,7 +328,18 @@ def main():
     if a.cmd == "build":
         sys.exit(cmd_build(a))
     if a.cmd == "verify":
-        rep = cmd_verify(a.image, a.out, a.rootfs, a.patchset)
+        ps = a.patchset
+        if not ps:
+            if not a.rootfs:
+                print("ERROR: verify 缺补丁集：请显式 --patchset（或给 --rootfs 以自动选择）",
+                      file=sys.stderr)
+                sys.exit(2)
+            try:
+                ps = fnos_patch.resolve_patchset(a.rootfs, None)
+            except RuntimeError as e:
+                print("ERROR: %s" % e, file=sys.stderr)
+                sys.exit(2)
+        rep = cmd_verify(a.image, a.out, a.rootfs, ps)
         sys.exit(0 if rep["ok"] else 1)
     if a.cmd == "release":
         sys.exit(cmd_release(a.out, a.name))

@@ -361,18 +361,36 @@ def status(rootfs):
     return st
 
 
+def resolve_patchset(rootfs, patches=None):
+    """--patches 缺省：按 rootfs 版本自动选同版本补丁集；找不到则显式失败。
+
+    原则：缺省永不指向任何具体旧版本（fnos-local-deb-head D2）。"""
+    if patches:
+        return patches
+    got = read_rootfs_version(rootfs)
+    if not got:
+        raise RuntimeError("未指定 --patches 且无法读取 rootfs 版本"
+                           "（usr/trim/etc/version 缺失），请显式 --patches 指定补丁集")
+    cand = os.path.join(TOOLCHAIN_DIR, "patches", "fnos-%s.json" % got.lstrip("Vv"))
+    if not os.path.isfile(cand):
+        raise RuntimeError("未指定 --patches 且无该版本补丁集（rootfs=%s，需人工 rebase），"
+                           "拒绝猜测旧版本" % got)
+    return cand
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["apply", "status"])
     ap.add_argument("--rootfs", required=True)
-    ap.add_argument("--patches", default=os.path.join(TOOLCHAIN_DIR, "patches", "fnos-1.2.0701.json"))
+    ap.add_argument("--patches", default=None,
+                    help="补丁集路径；缺省按 rootfs 版本自动选择（找不到则失败，永不默认旧版本）")
     ap.add_argument("--mount-shim", default=os.path.normpath(os.path.join(TOOLCHAIN_DIR, "..", "scripts", "stor-mount-shim.sh")))
     ap.add_argument("--no-version-check", action="store_true")
     a = ap.parse_args()
     if os.geteuid() != 0:
         print("需要 root", file=sys.stderr); sys.exit(1)
     if a.cmd == "apply":
-        for line in apply(a.rootfs, a.patches, a.mount_shim,
+        for line in apply(a.rootfs, resolve_patchset(a.rootfs, a.patches), a.mount_shim,
                           enforce_version=not a.no_version_check):
             print("  " + line)
     print(json.dumps(status(a.rootfs), ensure_ascii=False, indent=2))

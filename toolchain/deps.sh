@@ -9,9 +9,10 @@
 #
 # 依赖（按用途）:
 #   构建/提取 : isoinfo(genisoimage) dd tar gzip
+#   deb 覆盖  : dpkg-deb(dpkg；OTA 包组 data 解包，overlay 必需)
 #   镜像生成  : mkfs.ext4/e2fsck(e2fsprogs) rsync mount
 #   特征推导  : objdump/readelf(binutils)
-#   前端补丁  : zip/unzip（更新 .restore/www.zip 内加密条目）
+#   前端补丁  : zip/unzip（更新 .restore/www.zip 内加密条目)
 # ============================================================================
 set -uo pipefail
 
@@ -22,6 +23,7 @@ declare -A PKG=(
   [isoinfo]=genisoimage
   [dd]=coreutils
   [tar]=tar
+  [dpkg-deb]=dpkg
   [gzip]=gzip
   [rsync]=rsync
   [mount]=util-linux

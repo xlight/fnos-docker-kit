@@ -7,7 +7,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TC="$(dirname "$HERE")"
 ROOTFS="${ROOTFS:-}"
-PS="$TC/patches/fnos-1.2.0701.json"
+PS="${PS:-$(ls "$TC"/patches/fnos-*.json 2>/dev/null | grep -v '\.bak' | sort -V | tail -1)}"
+[ -n "$PS" ] || { echo "toolchain 内无可用补丁集"; exit 2; }
 BTRFS_IMG="${BTRFS_IMG:-./btrfs-test.raw}"
 ZFS_DS="${ZFS_DS:-wd500g/fnos-test}"
 PY="${PYTHON:-python3}"

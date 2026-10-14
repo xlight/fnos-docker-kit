@@ -8,11 +8,14 @@
 #
 # 用法: sudo bash tests/deploy-test.sh
 #   CTID=201 VOLFS=ext4 STORAGE=<PVE存储池> VOLSTORE=<ZFS池> OUT=<release 目录>
+#   REFCT=<参照容器id>  # 回撤后确认未受影响的参照容器（缺省不检查）
+# OUT 须为 pipeline --out 的 release 目录（含 image.raw；缺省 release-<ver> 对齐）
 # ============================================================================
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TC="$(dirname "$HERE")"
 CTID="${CTID:-201}"
+REFCT="${REFCT:-}"
 STORAGE="${STORAGE:-}"
 VOLFS="${VOLFS:-ext4}"
 VOLSTORE="${VOLSTORE:-}"
@@ -70,7 +73,11 @@ bash "$DEP" uninstall "$CTID" --storage "$STORAGE" >/dev/null 2>&1 \
   && ok "uninstall 完成" || no "uninstall"
 pct status "$CTID" >/dev/null 2>&1 && no "容器未移除" || ok "容器已移除"
 [ -e "/etc/pve/lxc/${CTID}.conf" ] && no "conf 残留" || ok "conf 已移除"
-CTID=200 pct status 200 2>/dev/null | grep -q running && ok "CT200 未受影响" || echo "  NOTE: CT200 非 running（与回撤无关，请人工确认）"
+if [ -n "$REFCT" ]; then
+  pct status "$REFCT" 2>/dev/null | grep -q running && ok "CT$REFCT 未受影响" || no "CT$REFCT 非 running"
+else
+  echo "  NOTE: 未设 REFCT，跳过参照容器确认"
+fi
 
 echo
 echo "== deploy-test: PASS=$pass FAIL=$fail =="

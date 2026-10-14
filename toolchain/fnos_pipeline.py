@@ -3,6 +3,8 @@
 # fnos_pipeline.py — fnOS 镜像流水线的单一编排入口
 #
 # 阶段（默认按序全跑）：
+#   overlay-> 可选前置：底座 rootfs 目录 + OTA 版本 → .deb 覆盖 + 版本戳
+#             （本地 deb-head；不给 --base 则跳过，ISO 路径出厂 rootfs 已就绪）
 #   patch  -> 给出厂 rootfs 打兼容补丁（fnos_patch）
 #   image  -> 生成镜像 raw ext4/btrfs（+ 可选 vztmpl / zfs）（fnos_image）
 #   verify -> 产出物验证 + 指纹 + 验证报告（fnos_build.cmd_verify）
@@ -15,7 +17,8 @@
 #       `rollback` 只删专属资源。需 root。
 #
 # 用法：
-#   fnos_pipeline.py run --rootfs <dir> --out <dir> [--version V1.2.0701]
+#   fnos_pipeline.py run --rootfs <dir> --out <dir> [--version V1.2.0800]
+#       [--base <底座rootfs目录> --ota-version <1.2.0800>]   # deb-head：overlay 前置
 #       [--fs ext4|btrfs] [--size 12] [--vztmpl] [--zfs pool/ds]
 #       [--stages patch,image,...] [--from image] [--to deploy]
 #       [--ctid 201] [--storage <pool>] [--volstore <pool>] [--volfs ext4]
@@ -38,11 +41,10 @@ import fnos_build   # noqa: E402
 import fnos_image   # noqa: E402
 import fnos_patch   # noqa: E402
 
-DEFAULT_PS = os.path.join(TC, "patches", "fnos-1.2.0701.json")
 # 公开仓脱敏：相对路径（不含任何宿主专有默认）
 DEFAULT_SHIM = os.path.normpath(os.path.join(TC, "..", "scripts", "stor-mount-shim.sh"))
 DEFAULT_SCRIPT_DIR = os.path.normpath(os.path.join(TC, "..", "scripts"))
-STAGE_ORDER = ["patch", "image", "verify", "release", "deploy", "storage", "smoke"]
+STAGE_ORDER = ["overlay", "patch", "image", "verify", "release", "deploy", "storage", "smoke"]
 
 
 def log(msg):
@@ -72,11 +74,19 @@ def ct_running(ctid):
 def missing_prereqs(stage, a, before=None):
     before = before or []
     miss = []
+    if stage == "overlay":
+        if not (a.base and os.path.isdir(a.base)):
+            miss.append("--base（已 extract 的底座 rootfs 目录）")
+        if not getattr(a, "ota_version", None) and not a.version:
+            miss.append("--ota-version（或 --version）目标 OTA 版本")
+        if (a.rootfs and os.path.isdir(a.rootfs) and os.listdir(a.rootfs)
+                and not a.force):
+            miss.append("rootfs 必须不存在或为空目录（防半覆盖态重入；换空目录或 --force 重建）")
     if stage == "patch":
-        if not (a.rootfs and os.path.isdir(a.rootfs)):
+        if not (a.rootfs and os.path.isdir(a.rootfs)) and "overlay" not in before:
             miss.append("rootfs")
     elif stage == "image":
-        if not (a.rootfs and os.path.isdir(a.rootfs)):
+        if not (a.rootfs and os.path.isdir(a.rootfs)) and "overlay" not in before:
             miss.append("rootfs（patch 阶段）")
     elif stage in ("verify", "release", "deploy"):
         if not os.path.isfile(os.path.join(a.out, "image.raw")) and "image" not in before:
@@ -92,7 +102,110 @@ def missing_prereqs(stage, a, before=None):
 
 
 # ---- stages -----------------------------------------------------------------
+# 本地 deb-head（语义与 CI public-ci.yml 的 deb 头步骤一字对齐，注释互引防漂移）：
+# B 文件覆盖法（dpkg-deb --fsys-tarfile 解 data 覆盖，不跑 dpkg 库与 pre/post）；
+# 运行时清理清单：machine-id、hostname、logs、/.dockerenv；machine-id 缺失由后续
+# patch/推送步重建；版本戳 usr/trim/etc/version 为 fnos_patch 版本锚点必需。
+OVERLAY_MARKER = ".fnos-overlay.json"
+
+
+def stage_overlay(a):
+    import glob
+    ota = (getattr(a, "ota_version", None) or a.version or "").lstrip("Vv")
+    if not ota:
+        print("overlay 需要 --ota-version（或 --version）", file=sys.stderr)
+        return 2
+    base = os.path.abspath(a.base)
+    rootfs = os.path.abspath(a.rootfs)
+    if base == rootfs:
+        print("overlay 拒绝：--base 与 --rootfs 不能是同一目录", file=sys.stderr)
+        return 2
+    marker_p = os.path.join(rootfs, OVERLAY_MARKER)
+    if os.path.isfile(marker_p) and not a.force:
+        try:
+            mk = json.load(open(marker_p))
+            if mk.get("base") == base and mk.get("ota_version") == ota:
+                log("overlay: 已覆盖（base=%s ota=%s），幂等跳过（--force 可重做）"
+                    % (base, ota))
+                return 0
+        except Exception:
+            pass
+    # --force 或 marker 不符：清空重做（防半覆盖态）
+    if os.path.isdir(rootfs):
+        for e in os.listdir(rootfs):
+            p = os.path.join(rootfs, e)
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+    else:
+        os.makedirs(rootfs, exist_ok=True)
+    log("overlay: cp -a 底座 %s -> %s" % (base, rootfs))
+    rc = run(["cp", "-a", base + "/.", rootfs + "/"])
+    if rc != 0:
+        return rc
+    # 运行时清理（与 CI 一致；断言防漏项）
+    for rel in ("etc/machine-id", "etc/hostname", ".dockerenv"):
+        p = os.path.join(rootfs, rel)
+        if os.path.lexists(p):
+            os.unlink(p)
+    for rel in ("var/log", "tmp", "run"):
+        d = os.path.join(rootfs, rel)
+        if os.path.isdir(d):
+            for e in os.listdir(d):
+                p = os.path.join(d, e)
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.unlink(p)
+    if os.path.lexists(os.path.join(rootfs, "etc/machine-id")):
+        print("overlay 清理漏项：machine-id 仍在", file=sys.stderr)
+        return 1
+    if os.path.lexists(os.path.join(rootfs, ".dockerenv")):
+        print("overlay 清理漏项：/.dockerenv 仍在", file=sys.stderr)
+        return 1
+    # .deb 包组现签现下（fetch-ota-debs 自带幂等跳过 + sha256 校验，失败即停）
+    debs_dir = a.debs_dir or os.path.join(a.out or ".", "ota-debs")
+    os.makedirs(debs_dir, exist_ok=True)
+    rc = run([sys.executable, os.path.join(TC, "fetch-ota-debs.py"),
+              "--version", ota, "--out", debs_dir])
+    if rc != 0:
+        print("overlay: .deb 下载失败，不产出半覆盖 rootfs", file=sys.stderr)
+        return rc
+    debs = sorted(glob.glob(os.path.join(debs_dir, "*.deb")))
+    if not debs:
+        print("overlay: 未下到任何 .deb", file=sys.stderr)
+        return 1
+    if not shutil.which("dpkg-deb"):
+        print("overlay 需要 dpkg-deb（见 deps.sh 最小集）", file=sys.stderr)
+        return 2
+    for d in debs:
+        log("overlay: %s" % os.path.basename(d))
+        p1 = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", d], stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["tar", "-x", "-C", rootfs], stdin=p1.stdout)
+        p1.stdout.close()
+        if p2.wait() != 0 or p1.wait() != 0:
+            print("overlay: 解包覆盖失败 %s" % d, file=sys.stderr)
+            return 1
+    # 版本戳（.deb 不含它；fnos_patch 版本锚点必需）
+    vstamp = os.path.join(rootfs, "usr/trim/etc/version")
+    os.makedirs(os.path.dirname(vstamp), exist_ok=True)
+    open(vstamp, "w").write(ota + "\n")
+    if open(vstamp).read().strip() != ota:
+        print("overlay: 版本戳写入失败", file=sys.stderr)
+        return 1
+    json.dump({"base": base, "ota_version": ota}, open(marker_p, "w"))
+    log("overlay: 就绪 ota=%s（底座 %s）" % (ota, base))
+    return 0
+
+
 def stage_patch(a):
+    if not a.patchset or not os.path.isfile(a.patchset):
+        print("ERROR: 无可用补丁集（version=%s；缺 %s，需人工 rebase），拒绝猜测旧版本"
+              % (a.version, os.path.join(TC, "patches",
+                                         "fnos-%s.json" % (a.version or "?").lstrip("Vv"))),
+              file=sys.stderr)
+        return 2
     st = fnos_patch.status(a.rootfs)
     if all(st.values()) and not a.force:
         log("patch: rootfs 已打补丁，幂等跳过")
@@ -192,9 +305,9 @@ def stage_smoke(a):
     return run(["bash", os.path.join(TC, "fnos_deploy.sh"), "smoke", str(a.ctid)])
 
 
-STAGES = {"patch": stage_patch, "image": stage_image, "verify": stage_verify,
-          "release": stage_release, "deploy": stage_deploy, "storage": stage_storage,
-          "smoke": stage_smoke}
+STAGES = {"overlay": stage_overlay, "patch": stage_patch, "image": stage_image,
+          "verify": stage_verify, "release": stage_release, "deploy": stage_deploy,
+          "storage": stage_storage, "smoke": stage_smoke}
 
 
 def select_stages(a):
@@ -203,16 +316,50 @@ def select_stages(a):
         bad = [s for s in chosen if s not in STAGE_ORDER]
         if bad:
             raise SystemExit("未知阶段: %s（可用: %s）" % (bad, ",".join(STAGE_ORDER)))
-        return [s for s in STAGE_ORDER if s in chosen]
-    if a.from_ or a.to:
+        chosen = [s for s in STAGE_ORDER if s in chosen]
+    elif a.from_ or a.to:
         lo = STAGE_ORDER.index(a.from_) if a.from_ else 0
         hi = STAGE_ORDER.index(a.to) if a.to else len(STAGE_ORDER) - 1
-        return STAGE_ORDER[lo:hi + 1]
-    return list(STAGE_ORDER)
+        chosen = STAGE_ORDER[lo:hi + 1]
+    else:
+        chosen = list(STAGE_ORDER)
+        # 纯缺省全量：无 --base 则跳过 overlay（ISO 路径出厂 rootfs 已就绪）。
+        # 显式点名（--stages/--from/--to 含 overlay）却没给 --base 时保留，
+        # 由 missing_prereqs 报缺 --base。
+        if "overlay" in chosen and not a.base:
+            chosen = [s for s in chosen if s != "overlay"]
+    return chosen
+
+
+def resolve_version(a):
+    """--version 缺省：读 rootfs 版本戳（V 前缀归一）；读不到返回 None（调用方必填报错）。"""
+    if a.version:
+        return a.version
+    if a.rootfs and os.path.isdir(a.rootfs):
+        got = fnos_patch.read_rootfs_version(a.rootfs)
+        if got:
+            return "V" + got.lstrip("Vv")
+    return None
+
+
+def resolve_patchset(a):
+    """--patchset 缺省：随版本推导；无对应文件返回 None（patch 入口失败，不静默旧版）。"""
+    if a.patchset:
+        return a.patchset
+    if a.version:
+        cand = os.path.join(TC, "patches", "fnos-%s.json" % a.version.lstrip("Vv"))
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 def do_run(a):
     stages = select_stages(a)
+    a.version = resolve_version(a)
+    if a.version is None and any(s in stages for s in ("overlay", "patch", "release")):
+        print("ERROR: 读不到版本（--rootfs 无版本戳），请显式 --version", file=sys.stderr)
+        return 2
+    a.patchset = resolve_patchset(a)
     log("阶段: %s" % " -> ".join(stages))
     # 前置检查（失败即停，明确缺失）
     allmiss = {}
@@ -274,12 +421,19 @@ def main():
     ap.add_argument("cmd", choices=["run", "rollback", "status"])
     ap.add_argument("--rootfs", default=None)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--version", default="V1.2.0701")
+    ap.add_argument("--base", default=None,
+                    help="deb-head 底座 rootfs 目录；给出则 run 自动先跑 overlay（ISO 路径不给）")
+    ap.add_argument("--ota-version", default=None,
+                    help="overlay 目标 OTA 版本（如 1.2.0800）；缺省回落到 --version")
+    ap.add_argument("--debs-dir", default=None,
+                    help="OTA .deb 包组缓存目录；缺省为 <out>/ota-debs（重跑跳过已下包）")
+    ap.add_argument("--version", default=None,
+                    help="fnOS 版本（如 V1.2.0800）；缺省读 --rootfs 版本戳，读不到则必填报错")
     ap.add_argument("--fs", default="ext4", choices=["ext4", "btrfs"])
     ap.add_argument("--size", default=12)
     ap.add_argument("--vztmpl", action="store_true")
     ap.add_argument("--zfs")
-    ap.add_argument("--patchset", default=DEFAULT_PS)
+    ap.add_argument("--patchset", default=None)
     ap.add_argument("--shim", default=DEFAULT_SHIM)
     ap.add_argument("--no-version-check", action="store_true")
     ap.add_argument("--stages")

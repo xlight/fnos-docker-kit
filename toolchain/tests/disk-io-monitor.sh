@@ -19,7 +19,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TC="$(dirname "$HERE")"
 PY="${PYTHON:-python3}"
-PATCHSET="$TC/patches/fnos-1.2.0701.json"
+PATCHSET="${PATCHSET:-$(ls "$TC"/patches/fnos-*.json 2>/dev/null | grep -v '\.bak' | sort -V | tail -1)}"
+# fixture 指引（公开仓契约）：用自己的 ISO 生成（extract），再传入对应目录；
+# PATCHSET/FIXTURE 必须同版本，一致性由上面的守卫强制，有漂移即明确中止。
 AP="$TC/aobpatch.py"
 # 全量补丁态（resmon 应为默认终态）的构建 rootfs，以及工厂 orig（resmon=orig）
 # fixture 指引（公开仓契约）：用自己的 ISO 生成（extract），再传入对应目录
