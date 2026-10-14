@@ -181,8 +181,15 @@ def stage_overlay(a):
         return 2
     for d in debs:
         log("overlay: %s" % os.path.basename(d))
+        # --keep-directory-symlink 至关重要（注意不是 -k：-k 含 --keep-old-files
+        # 会拒绝覆盖底座已有文件，如 0701 自带的 appcenter-cli）。.deb 内含
+        # `./lib/` `./sbin/` 等真实目录项；底座是 usrmerge 布局（lib->usr/lib
+        # 等符号链接）。无此旗标时 tar 会把链接替换成实目录，后续内容只进影子
+        # 目录，原 1950+ 库文件被遮蔽（2026-10-14 实测：/sbin/init 与
+        # /lib/systemd/systemd 全部 dangling，容器无法启动）。CI deb-head 同理。
         p1 = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", d], stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(["tar", "-x", "-C", rootfs], stdin=p1.stdout)
+        p2 = subprocess.Popen(["tar", "-x", "--keep-directory-symlink", "-C", rootfs],
+                              stdin=p1.stdout)
         p1.stdout.close()
         if p2.wait() != 0 or p1.wait() != 0:
             print("overlay: 解包覆盖失败 %s" % d, file=sys.stderr)

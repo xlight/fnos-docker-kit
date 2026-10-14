@@ -730,7 +730,10 @@
     },
     "usr/trim/bin/resmon_service": {
       "orig": "e5c76758f6c897680c0a9aa8efecf95e2d906db6b35eddcc97520d6df36160dc",
-      "patched": "9a5af10e65a07729f78cacb7583515fb3db16f7a6a421e78cef390b2a22c21ec"
+      "patched": [
+        "9a5af10e65a07729f78cacb7583515fb3db16f7a6a421e78cef390b2a22c21ec",
+        "231f239460c7e6d3bd75e54040f762e953766a403b18cc9e2b3c47089c80e5ee"
+      ]
     }
   }
 }

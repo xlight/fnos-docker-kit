@@ -232,6 +232,7 @@ do_status() {
 # ---- 冒烟：宿主侧装配 + 服务链 + 写操作（skill 9.1）-------------------------
 smoke() {
   local id="$1" ok=1
+  local tc_dir; tc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   chk(){ # <desc> <0|1>
     if [ "$2" = 1 ]; then echo "  PASS: $1"; else echo "  FAIL: $1"; ok=0; fi
   }
@@ -338,18 +339,13 @@ smoke() {
   fi
 
   echo "== [9] 上传文件夹/权限检查兼容垫片 =="
-  s9="$(pct exec "$id" -- python3 -c 'ok=True
-for n,p,o,w in [("upload-folder-mode8","/usr/trim/lib/libnfile.so",0x4afa,"02"),("struct-to-path","/usr/trim/lib/libnperm.so",0x3e8c,"8b")]:
-    try: b=open(p,"rb").read()[o:o+1].hex()
-    except Exception: b="ERR"
-    g=(b==w); ok=ok and g
-    print(("PASS" if g else "FAIL"),n,b)
-print("ALL" if ok else "SOME")' 2>/dev/null || echo "$(printf 'FAIL\terr\nSOME')")"
+  # 版本无关（0701 硬编码偏移已删：0800 下偏移全变）：helper 进容器按版本戳选
+  # 烘焙补丁集，跑烘焙 aobpatch check，按 (文件, find->to) 语义定位两个功能站点。
+  s9="$(pct push "$id" "$tc_dir/s9-shim-check.py" /tmp/s9-shim-check.py >/dev/null 2>&1 && pct exec "$id" -- python3 /tmp/s9-shim-check.py 2>/dev/null || echo "$(printf 'FAIL\tpush-or-exec\nSOME')")"
   echo "$s9" | grep -E '^(PASS|FAIL)' | sed 's/^/   /'
   case "$s9" in *ALL*) chk "上传文件夹/权限检查垫片在位" 1 ;; *) chk "上传文件夹/权限检查垫片在位" 0 ;; esac
 
   echo "== [10] 内存视图（memview UI patch + 口径校验） =="
-  tc_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ -x "$tc_dir/../scripts/smoke-memview.sh" ]; then
     CTID="$id" bash "$tc_dir/../scripts/smoke-memview.sh" 2>&1 | sed 's/^/   /'
   else
