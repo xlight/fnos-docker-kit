@@ -6,6 +6,9 @@
 #   - 所有机制脚本统一提供 apply|rollback|status 三个子命令，幂等
 #   - 每次变更必须 manifest_add 一条 JSON（审计 + 供 rollback.sh 逆序全撤）
 #   - 备份落在宿主 $HOST_BACKUP_ROOT/<ts>/，容器侧文件同时 pct pull 一份到宿主
+#   - 退出码家规（fnos-ops-tui D2）：0 成功 / 1 通用失败 / 2 用法错误或前置缺失
+#     （含显式拒绝，如缺确认的 destroy）；130 按惯例保留给 Ctrl-C 中断。
+#     调用者据此区分"展示用法"与"展示错误"，绝不把 2 当失败重试。
 set -uo pipefail
 
 # ---------- 可覆盖的环境默认值 ----------
@@ -52,12 +55,45 @@ need_ct() {
 }
 ct()  { pct exec "$CTID" -- "$@"; }
 
+# ---------- 退出码家规（fnos-ops-tui D2：0 成功 / 1 通用失败 / 2 用法错误或前置缺失；
+# 130 按惯例保留给 Ctrl-C 中断。调用者据此区分"展示用法"与"展示错误"，绝不把 2 当失败重试） ----------
+
+# ---------- 机器输出信封（fnos-ops-tui D2：stdout 单个对象 + 诊断走 stderr） ----------
+# 约定：--json 输出 = stdout 有且仅有一个 JSON 对象
+#   {schemaVersion:1, ok, data?, error:{code,message}?}，人类 prose 与诊断一律走
+#   stderr，无颜色码；退出码语义不变（0/1/2 见上）。schemaVersion 只在破坏性变更
+#   时 bump；消费者先断言版本再解析。
+json_ok() {  # $1 = data JSON（调用者拼好的对象/数组；缺省 null）
+  printf '{"schemaVersion":1,"ok":true,"data":%s}\n' "${1:-null}"
+}
+json_err() {  # $1 = code（稳定机器码） $2 = message（人类可读）
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+print(json.dumps({"schemaVersion": 1, "ok": False,
+                  "error": {"code": sys.argv[1], "message": sys.argv[2]}}))
+PY
+  else
+    printf '{"schemaVersion":1,"ok":false,"error":{"code":"error","message":"%s"}}\n' \
+      "$(printf '%s' "$2" | tr -d '\"\\')"
+  fi
+}
+
 # ---------- 备份与 manifest ----------
 host_backup_dir() { d="$HOST_BACKUP_ROOT/$(ts)"; mkdir -p "$d"; printf '%s\n' "$d"; }
 ct_backup_dir()   { d="$CT_BACKUP_ROOT/$(ts)"; ct mkdir -p "$d" >/dev/null; printf '%s\n' "$d"; }
-manifest_add() {  # $1 = JSON 对象字符串
+manifest_add() {  # $1 = JSON 对象字符串（必须合法 JSON，否则拒绝写入；flock 串行多写者）
   mkdir -p "$(dirname "$MANIFEST")"
-  printf '%s\n' "$1" >> "$MANIFEST"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null \
+      || { printf 'manifest_add 拒绝：非合法 JSON（未写入）: %.160s\n' "$1" >&2; return 1; }
+  fi
+  (
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>"$MANIFEST.lock"; flock -x 9
+    fi
+    printf '%s\n' "$1" >> "$MANIFEST"
+  )
 }
 
 # ---------- RPC 探针 ----------

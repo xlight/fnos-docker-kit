@@ -18,7 +18,7 @@
 set -uo pipefail
 CMD="${1:-}"; ID="${2:-}"
 STORAGE="${STORAGE:-}"; SIZE=12; IMAGE=""; HOSTNAME_="fnos-lxc"
-CPUS=2; MEM=2048; NO_START=0
+CPUS=2; MEM=2048; NO_START=0; JSON_OUT=0
 # 镜像内需 mask 的单元（与 fnos_patch.py 的 MASK_UNITS 保持一致；空格分隔）
 # nfsd 是宿主内核全局态，容器内跑 nfs-server 会直接在宿主起 rpc.nfsd 并与其它实例互踩。
 MASK_UNITS="nfs-server.service"
@@ -37,6 +37,7 @@ while [ $# -gt 0 ]; do
     --mem) MEM="$2"; shift 2;;
     --ip) CT_IP="$2"; shift 2;;
     --no-start) NO_START=1; shift;;
+    --json) JSON_OUT=1; shift;;
     *) echo "未知参数: $1" >&2; exit 2;;
   esac
 done
@@ -223,8 +224,29 @@ do_install_vztmpl() {
 
 do_start(){ need_root; pct start "$ID"; }
 
-do_status() {
+do_status() {  # status <id> [--json]：--json 走机器信封（stdout 纯 JSON）
   need_root
+  local st running="" ver="" psets="" units="" mask=""
+  st="$(pct status "$ID" 2>&1)"
+  if printf '%s' "$st" | grep -q running; then running=1; else running=0; fi
+  if [ "$running" = 1 ]; then
+    ver="$(pct exec "$ID" -- cat /usr/trim/etc/version 2>/dev/null || true)"
+    psets="$(pct exec "$ID" -- sh -c 'ls /usr/local/share/fnos-toolchain/patches/fnos-*.json 2>/dev/null' 2>/dev/null | tr '\n' ' ' || true)"
+    units="$(pct exec "$ID" -- systemctl is-active trim_main trim_nginx 2>/dev/null | tr '\n' ' ' || true)"
+    mask="$(pct exec "$ID" -- systemctl is-enabled nfs-server 2>/dev/null || true)"
+  fi
+  if [ "$JSON_OUT" = 1 ]; then
+    ID="$ID" RUNNING="$running" VER="$ver" PSETS="$psets" UNITS="$units" MASK="$mask" python3 - <<'PY'
+import json, os
+def s(v): return (v.strip() or None) if v else None
+print(json.dumps({"schemaVersion": 1, "ok": True, "data": {
+    "ctid": os.environ["ID"], "running": os.environ["RUNNING"] == "1",
+    "fnos_version": s(os.environ["VER"]),
+    "patchsets": (os.environ["PSETS"].split() or None),
+    "units": s(os.environ["UNITS"]), "nfs_mask": s(os.environ["MASK"])}}))
+PY
+    return
+  fi
   echo "== conf =="; [ -f "$CONF" ] && cat "$CONF" || echo "(无)"
   echo "== pct status =="; pct status "$ID" 2>&1
 }

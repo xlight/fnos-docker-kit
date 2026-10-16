@@ -222,7 +222,7 @@ ensure_passthrough() {
 ensure_mask() {
   load_state
   local mdn dmn; mdn="$(basename "$MD_DEV")"; dmn="$(basename "$(readlink -f "$DM_DEV")")"
-  DEVS="${NVME_DEV} ${mdn} ${dmn}" bash "$SCRIPT_DIR/stor-mask.sh" apply >/dev/null 2>&1 && log "已应用 /sys/block 屏蔽（${NVME_DEV} ${mdn} ${dmn}）"
+  DEVS="${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}" bash "$SCRIPT_DIR/stor-mask.sh" apply >/dev/null 2>&1 && log "已应用 /sys/block 屏蔽（${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}）"
 }
 
 # ---------- 5b) zfs：容器侧挂载 unit ----------
@@ -434,28 +434,65 @@ EOF
   manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"destroy","ctid":%s,"confirm":"%s"}' "$(date -Is)" "$CTID" "${CONFIRM_DESTROY:-no}")"
   log "destroy 完成"
 }
-do_status() {
-  need_root
-  load_state
-  log "== stor-manage status (CT$CTID) =="
-  printf '  zvol      : %s\n' "$(zfs list -H -o name,volsize "${VOLSTORE}/${VOLNAME}" 2>/dev/null || echo 缺失)"
-  printf '  nvmet NQN : %s\n' "$([ -e /sys/kernel/config/nvmet/subsystems/$NQN ] && echo 存在 || echo 缺失)"
-  printf '  NVMe 盘   : %s\n' "$(nvme_dev_for_nqn "$NQN" 2>/dev/null || echo 缺失)"
-  printf '  VG        : %s\n' "$(vgs "${VG:-trim_none}" --noheadings -o vg_name 2>/dev/null | tr -d ' ' || echo -)"
-  printf '  md/LV     : %s / %s\n' "${MD_DEV:-?}" "${DM_DEV:-?}"
-  printf '  透传 dev%s: %s\n' "$DEVID" "$(conf_has "dev${DEVID}:" && echo 有 || echo 无)"
-  printf '  /sys/block 屏蔽: %s\n' "$(conf_has "sys/block" && echo 有 || echo 无)"
-  printf '  自愈 unit : %s\n' "$(systemctl is-enabled "fnos-stor-ct${CTID}.service" 2>/dev/null || echo 未启用)"
-  if pct status "$CTID" 2>/dev/null | grep -q running; then
-    printf '  容器内 /vol: %s\n' "$(ct sh -c 'findmnt -rno TARGET,SOURCE | grep /vol | tr "\n" " "' 2>/dev/null)"
+do_status() {  # [$1] --json 时走机器信封（stdout 纯 JSON，诊断走 stderr）
+  local json=0; [ "${1:-}" = "--json" ] && json=1
+  if [ "$(id -u)" != 0 ]; then
+    if [ "$json" = 1 ]; then json_err need_root "需要 root（宿主上请 sudo 运行）"; exit 1; fi
+    need_root
   fi
+  load_state
+  local zvol nvmet nvme vg md lv passthru mask unit vol running
+  zvol="$(zfs list -H -o name,volsize "${VOLSTORE}/${VOLNAME}" 2>/dev/null || true)"
+  [ -e "/sys/kernel/config/nvmet/subsystems/$NQN" ] && nvmet=1 || nvmet=0
+  nvme="$(nvme_dev_for_nqn "$NQN" 2>/dev/null || true)"
+  vg="$(vgs "${VG:-trim_none}" --noheadings -o vg_name 2>/dev/null | tr -d ' ' || true)"
+  md="${MD_DEV:-}"; lv="${DM_DEV:-}"
+  conf_has "dev${DEVID}:" && passthru=1 || passthru=0
+  conf_has "sys/block" && mask=1 || mask=0
+  unit="$(systemctl is-enabled "fnos-stor-ct${CTID}.service" 2>/dev/null || true)"
+  running=""; vol=""
+  if pct status "$CTID" 2>/dev/null | grep -q running; then
+    running=1
+    vol="$(ct sh -c 'findmnt -rno TARGET,SOURCE 2>/dev/null | grep /vol | tr "\n" " "' 2>/dev/null || true)"
+  else
+    running=0
+  fi
+  if [ "$json" = 1 ]; then
+    CTID="$CTID" DEVID="$DEVID" ZVOL="$zvol" NVMET="$nvmet" NVME="$nvme" \
+    VG="$vg" MD="$md" LV="$lv" PASSTHRU="$passthru" MASK="$mask" UNIT="$unit" \
+    RUNNING="$running" VOL="$vol" python3 - <<'PY'
+import json, os
+def s(v): return v if v else None
+print(json.dumps({"schemaVersion": 1, "ok": True, "data": {
+    "ctid": int(os.environ["CTID"]), "devid": os.environ["DEVID"],
+    "zvol": s(os.environ["ZVOL"]), "nvmet": os.environ["NVMET"] == "1",
+    "nvme": s(os.environ["NVME"]), "vg": s(os.environ["VG"]),
+    "md": s(os.environ["MD"]), "lv": s(os.environ["LV"]),
+    "passthrough": os.environ["PASSTHRU"] == "1",
+    "sysblock_mask": os.environ["MASK"] == "1",
+    "heal_unit": s(os.environ["UNIT"]),
+    "container_running": os.environ["RUNNING"] == "1",
+    "vol": s(os.environ["VOL"].strip())}}, ensure_ascii=False))
+PY
+    return
+  fi
+  log "== stor-manage status (CT$CTID) =="
+  printf '  zvol      : %s\n' "${zvol:-缺失}"
+  printf '  nvmet NQN : %s\n' "$([ "$nvmet" = 1 ] && echo 存在 || echo 缺失)"
+  printf '  NVMe 盘   : %s\n' "${nvme:-缺失}"
+  printf '  VG        : %s\n' "${vg:-}"
+  printf '  md/LV     : %s / %s\n' "${md:-?}" "${lv:-?}"
+  printf '  透传 dev%s: %s\n' "$DEVID" "$([ "$passthru" = 1 ] && echo 有 || echo 无)"
+  printf '  /sys/block 屏蔽: %s\n' "$([ "$mask" = 1 ] && echo 有 || echo 无)"
+  printf '  自愈 unit : %s\n' "${unit:-未启用}"
+  [ -n "$vol" ] && printf '  容器内 /vol: %s\n' "$vol"
 }
 
 case "${1:-status}" in
   create)     do_create ;;
   up)         do_up ;;
   destroy)    [ -n "$_CTID_IN" ] || { echo "拒绝：destroy 必须显式指定 CTID（防误删；如: sudo -n env CTID=201 bash $0 destroy）" >&2; exit 2; }; do_destroy ;;
-  status)     do_status ;;
+  status)     do_status "${2:-}" ;;
   register)   do_register ;;
   unregister) do_unregister ;;
   *) echo "用法: $0 create|up|destroy|status|register|unregister"; exit 2 ;;

@@ -419,7 +419,9 @@ def do_status(a):
         info["release"] = os.listdir(rel) if os.path.isdir(rel) else []
     if a.ctid:
         info["container_running"] = ct_running(a.ctid)
-    print(json.dumps(info, ensure_ascii=False, indent=2))
+    # 机器信封（fnos-ops-tui D2）：stdout 单对象 {schemaVersion,ok,data}
+    print(json.dumps({"schemaVersion": 1, "ok": True, "data": info},
+                     ensure_ascii=False, indent=2))
     return 0
 
 
