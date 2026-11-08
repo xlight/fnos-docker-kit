@@ -159,6 +159,7 @@ jobs:
       ready: ${{ steps.check.outputs.ready }}
       total: ${{ steps.check.outputs.total }}
       patchset_sha256: ${{ steps.check.outputs.patchset_sha256 }}
+      version: ${{ needs.detect.outputs.version }}
     env:
       VERSION: ${{ needs.detect.outputs.version }}
       BRANCH: ${{ needs.detect.outputs.branch }}
@@ -435,44 +436,33 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: 生成并校验就绪索引（与 build 的 check 报告一致）
+      - name: 校验就绪索引与补丁集自洽（发布前门禁）
         run: |
           ver="${GITHUB_REF#refs/tags/v}"
           ps="toolchain/patches/fnos-$ver.json"
+          idx="toolchain/patches/index.json"
           [ -f "$ps" ] || { echo "patchset missing in tag: $ps"; exit 1; }
-          python3 - "$ps" <<'PY'
-          import json, hashlib, sys, os, datetime
-          ps_path = sys.argv[1]
-          raw = open(ps_path, 'rb').read()
-          ps = json.loads(raw)
-          val = ps.get('validation') or {}
-          ver = str(ps.get('fnos_version', '')).lstrip('Vv')
-          ready, total = val.get('ready'), val.get('total')
-          idx = {"revision": 1,
-                 "generated": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                 "versions": {ver: {"patchset": os.path.basename(ps_path),
-                                    "sha256": hashlib.sha256(raw).hexdigest(),
-                                    "ready": ready, "total": total,
-                                    "status": "ready" if ready == total else "partial",
-                                    "validated_at": val.get('validated_at')}}}
-          json.dump(idx, open('toolchain/patches/index.json', 'w'), ensure_ascii=False, indent=2)
-          print('index:', idx['versions'][ver])
-          PY
-          python3 toolchain/tests/validate-index.py --index toolchain/patches/index.json
-          # 严格路径：validation 计数必须与 build 阶段 aobpatch check 的报告一致
-          if [ -n "${{ needs.build.outputs.ready }}" ]; then
+          [ -f "$idx" ] || { echo "index missing in tag: $idx"; exit 1; }
+          # 索引必须是 tag 内已发布的那份（sync-public 生成，含全部版本），不重新生成
+          python3 toolchain/tests/validate-index.py --index "$idx"
+          # 索引条目里的 sha256 必须等于 tag 内补丁集文件的实际哈希（发布一致性）
+          idx_sha=$(python3 -c "import json;print(json.load(open('$idx'))['versions']['$ver']['sha256'])")
+          actual=$(sha256sum "$ps" | awk '{print $1}')
+          if [ "$idx_sha" != "$actual" ]; then
+            echo "index sha256 mismatch: $idx_sha != $actual"; exit 1
+          fi
+          # 只有 build 校验的**同一版本**时才做跨报告比对（build 可能跑的是另一个版本）
+          if [ "${{ needs.build.outputs.version }}" = "$ver" ]; then
             v_ready=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['ready'])")
             v_total=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['total'])")
             if [ "$v_ready" != "${{ needs.build.outputs.ready }}" ] || [ "$v_total" != "${{ needs.build.outputs.total }}" ]; then
               echo "validation ($v_ready/$v_total) != patch-report (${{ needs.build.outputs.ready }}/${{ needs.build.outputs.total }})"; exit 1
             fi
-          fi
-          # sha256 必须与 build 阶段报告一致
-          if [ -n "${{ needs.build.outputs.patchset_sha256 }}" ]; then
-            actual=$(sha256sum "$ps" | awk '{print $1}')
             if [ "$actual" != "${{ needs.build.outputs.patchset_sha256 }}" ]; then
               echo "patchset sha256 mismatch: $actual != ${{ needs.build.outputs.patchset_sha256 }}"; exit 1
             fi
+          else
+            echo "build 校验的是 ${{ needs.build.outputs.version }}，本 Release 发布 $ver → 跨版本，跳过报告比对"
           fi
       - name: 幂等发布补丁集与索引到 Release（单 job 串行 clobber）
         run: |
