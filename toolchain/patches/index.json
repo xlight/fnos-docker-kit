@@ -1,7 +1,15 @@
 {
-  "revision": 10,
-  "generated": "2026-11-08T05:11:04Z",
+  "revision": 12,
+  "generated": "2026-11-08T06:00:45Z",
   "versions": {
+    "1.2.1000": {
+      "patchset": "fnos-1.2.1000.json",
+      "sha256": "3d4b8f58e967ff4875358f5ec5bbac3753db9c122ce1a87e20d2ca877b392c77",
+      "ready": 37,
+      "total": 37,
+      "status": "ready",
+      "validated_at": "2026-11-08T05:57:54Z"
+    },
     "1.2.1010": {
       "patchset": "fnos-1.2.1010.json",
       "sha256": "7090e5988f8af64e68f7685c2bb5d0622e506f8c5dceab70fe6089c15629c37f",
