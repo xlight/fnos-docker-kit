@@ -429,8 +429,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [detect, build]
+    # 发布 Release 资产（补丁集 + 索引）与"构建镜像"是两件事：
+    #  - build 成功 → 正常发
+    #  - build 被跳过（同版本 DockerHub 已有镜像，detect 去重）→ 仍然发
+    #  - build 失败 → 不发（避免把未验证的补丁集当正式资产发布）
+    if: always() && startsWith(github.ref, 'refs/tags/v') && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-22.04
     permissions:
       contents: write
