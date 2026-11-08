@@ -740,10 +740,13 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
     zpool_path = os.path.join(rootfs, "sbin", "zpool")
     zpool_real = os.path.join(rootfs, "sbin", "zpool.real")
     if os.path.exists(zpool_path) and not os.path.exists(zpool_real):
-        # 检查是否已经是 shim（避免重复重命名）
+        # 检查是否已经是 shim（避免重复重命名）。
+        # 必须按**二进制**读：1.2.1000 的 ISO 里 /sbin/zpool 是真 ELF（zfs 用户态工具），
+        # 按文本解码会 UnicodeDecodeError 直接把构建打挂。
         try:
-            content = open(zpool_path).read()
-            if "zpool shim for fnOS in LXC container" not in content:
+            with open(zpool_path, "rb") as f:
+                content = f.read()
+            if b"zpool shim for fnOS in LXC container" not in content:
                 os.rename(zpool_path, zpool_real)
                 log.append("renamed /sbin/zpool -> /sbin/zpool.real")
         except (OSError, IOError):
@@ -868,8 +871,10 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
 
 
 def _has(rootfs, rel, needle):
+    """二进制安全的内容包含判定（目标可能是 ELF 等二进制，不能按 UTF-8 解码）。"""
     try:
-        return needle in open(os.path.join(rootfs, rel)).read()
+        with open(os.path.join(rootfs, rel), "rb") as f:
+            return needle.encode() in f.read()
     except OSError:
         return False
 
@@ -953,8 +958,9 @@ def status(rootfs):
     zpool_path = os.path.join(rootfs, "sbin", "zpool")
     if os.path.exists(zpool_path):
         try:
-            zpool_content = open(zpool_path).read()
-            st["zpool shim"] = "zpool shim for fnOS in LXC container" in zpool_content
+            with open(zpool_path, "rb") as f:   # 二进制安全（可能是真 ELF）
+                zpool_content = f.read()
+            st["zpool shim"] = b"zpool shim for fnOS in LXC container" in zpool_content
         except (OSError, IOError):
             st["zpool shim"] = False
     else:

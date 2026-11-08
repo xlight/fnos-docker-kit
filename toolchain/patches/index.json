@@ -1,6 +1,6 @@
 {
-  "revision": 12,
-  "generated": "2026-11-08T06:00:45Z",
+  "revision": 13,
+  "generated": "2026-11-08T08:16:30Z",
   "versions": {
     "1.2.1000": {
       "patchset": "fnos-1.2.1000.json",
