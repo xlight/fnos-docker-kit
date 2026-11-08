@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""fnos-patch-status — unified patch status detector for fnOS in LXC.
+
+Detects the application state of all three patch layers:
+  Layer 1 (AOB):    Binary/text patches via aobpatch.py check
+  Layer 2 (mech):   Mechanism patches (zpool shim, pg fix, dirfd, trash, mount, nic, disk-io, ssh, nfs)
+  Layer 3 (image):  Image pipeline patches (fstab, patch set/engine, units, wait-online)
+
+Usage (in container as root):
+  fnos-patch-status [--json] [--table] [--log] [--notify] [--auto-fix] [--exit-code]
+
+Exit codes:
+  0 = all healthy
+  1 = issues found
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+AOB_PATCHSET = "/usr/local/share/fnos-toolchain/patches/fnos-1.2.0800.json"  # 旧固定值，不再使用；版本选择见 select_patchset()
+AOBPATCH = "/usr/local/share/fnos-toolchain/aobpatch.py"
+PATCHES_DIR = "/usr/local/share/fnos-toolchain/patches"
+VERSION_PATH = "/usr/trim/etc/version"
+# 检测层状态分类：硬失败计 issue；skipped / ready-unverified 只记 warning
+ISSUE_STATUSES = {"ready", "failed", "signature-not-found", "expect-mismatch",
+                  "unknown-file-hash", "missing-file", "verify-failed"}
+WARN_STATUSES = {"skipped", "ready-unverified"}
+
+
+def _vtuple(v):
+    import re
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", str(v))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def select_patchset():
+    """精确匹配 → 最近严格更早版本 → no-compatible。返回 (mode, path)。
+
+    带后缀的预发布版本（如 1.2.1010-rc1）除精确字符串匹配外一律 no-compatible。"""
+    import glob, re
+    try:
+        rv = open(VERSION_PATH).read().strip().lstrip("Vv")
+    except OSError:
+        rv = ""
+    clean = bool(re.match(r"\s*\d+(?:\.\d+)*\s*$", rv))
+    best = None
+    for f in sorted(glob.glob(os.path.join(PATCHES_DIR, "fnos-*.json"))):
+        try:
+            v = str(json.load(open(f)).get("fnos_version", "")).lstrip("Vv")
+        except Exception:
+            continue
+        if rv and v == rv:
+            return "exact", f
+        if rv and clean and _vtuple(v) < _vtuple(rv):
+            if best is None or _vtuple(v) > _vtuple(best[0]):
+                best = (v, f)
+    if best:
+        return "fallback", best[1]
+    return "no-compatible", None
+FNOS_PATCH = "/usr/local/share/fnos-toolchain/fnos_patch.py"
+ZPOOL_MARKER = "zpool shim for fnOS in LXC container"
+NOTIFY_SOURCE = "trim.fnos-patch-status"
+LOG_FILE = "/var/log/fnos-patch-status.log"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd, timeout=30):
+    """Run a command and return (rc, stdout, stderr)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except FileNotFoundError:
+        return -1, "", "not found"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def file_contains(path, needle):
+    """Check if file exists and contains needle string."""
+    try:
+        with open(path) as f:
+            return needle in f.read()
+    except (OSError, IOError):
+        return False
+
+
+def file_exists(path):
+    return os.path.exists(path)
+
+
+def is_symlink(path):
+    return os.path.islink(path)
+
+
+def is_masked(rootfs, unit):
+    """Check if a systemd unit is masked (symlink to /dev/null)."""
+    p = os.path.join(rootfs, "etc/systemd/system", unit)
+    if os.path.islink(p):
+        try:
+            return os.readlink(p) == "/dev/null"
+        except OSError:
+            return False
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: AOB patches
+# ---------------------------------------------------------------------------
+
+def detect_aob():
+    """Run aobpatch.py check for both aob and text patches."""
+    issues = []
+    details = {"patches": [], "ok": True, "phase": "unknown"}
+
+    if not os.path.exists(AOBPATCH):
+        return {"layer": "aob", "ok": False, "issues": ["aobpatch.py not found"],
+                "patches": [], "phase": "missing-engine", "mode": "unknown"}
+
+    mode, patchset = select_patchset()
+    details["mode"] = mode
+    if patchset is None:
+        return {"layer": "aob", "ok": False, "issues": ["no-compatible-patchset"],
+                "patches": [], "phase": "missing-patchset", "mode": mode}
+    details["patchset"] = os.path.basename(patchset)
+
+    def check(only, timeout):
+        cmd = [sys.executable, AOBPATCH, "check", "--rootfs", "/", "--patchset", patchset,
+               "--only", only, "--best-effort"]
+        if mode == "fallback":
+            cmd.append("--fallback")
+        rc, stdout, stderr = run_cmd(cmd, timeout=timeout)
+        # 无论 rc 是否为 0，只要 stdout 是合法 JSON 就解析 per-patch 状态
+        try:
+            data = json.loads(stdout)
+        except (json.JSONDecodeError, ValueError):
+            return None, f"aobpatch {only} check 输出非 JSON (rc={rc}): {stderr[:200]}"
+        return data, None
+
+    all_patches = []
+    all_issues = []
+    all_warnings = []
+    phases = []
+    for only, timeout in (("aob", 120), ("text", 60)):
+        data, err = check(only, timeout)
+        if data is None:
+            all_issues.append(err)
+            continue
+        phases.append(data.get("phase", "unknown"))
+        for p in data.get("patches", []):
+            pid = p.get("id", "unknown")
+            status = str(p.get("status", "unknown")).split("(")[0]  # 归一化 expect-mismatch(N!=M)
+            if status in ISSUE_STATUSES:
+                all_issues.append(f"AOB:{pid}: {status}")
+            elif status in WARN_STATUSES:
+                all_warnings.append(f"AOB:{pid}: {status}" + (f" ({p.get('reason')})" if p.get("reason") else ""))
+            all_patches.append(p)
+        for w in data.get("warnings", []):
+            if w not in all_warnings:
+                all_warnings.append(w)
+
+    details["patches"] = all_patches
+    details["warnings"] = all_warnings
+    details["ok"] = len(all_issues) == 0
+    details["phase"] = phases[0] if phases else "unknown"
+    details["issues"] = all_issues
+    return details
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Mechanism patches
+# ---------------------------------------------------------------------------
+
+def detect_mechanism(aob_patches=None):
+    """Check mechanism patch components."""
+    issues = []
+    checks = {}
+
+    # zpool shim
+    zpool_path = "/sbin/zpool"
+    if os.path.exists(zpool_path):
+        checks["zpool shim"] = file_contains(zpool_path, ZPOOL_MARKER)
+    else:
+        checks["zpool shim"] = True  # not applicable
+
+    # pg backup dir
+    pg_dir = "/etc/postgresql"
+    if os.path.isdir(pg_dir):
+        checks["pg backup dir"] = os.path.exists("/var/backups/postgresql")
+        # pg hba replication entry
+        pg_hba_found = False
+        for v in os.listdir(pg_dir):
+            cand = os.path.join(pg_dir, v, "main", "pg_hba.conf")
+            if os.path.exists(cand):
+                try:
+                    for line in open(cand):
+                        if ("replication" in line and "postgres" in line
+                                and line.strip().startswith("local")):
+                            pg_hba_found = True
+                            break
+                except (OSError, IOError):
+                    pass
+        checks["pg hba replication entry"] = pg_hba_found
+    else:
+        checks["pg backup dir"] = True
+        checks["pg hba replication entry"] = True
+
+    # zpool shim unit
+    zpool_unit = "/etc/systemd/system/fnos-zpool-shim.service"
+    if os.path.exists(zpool_unit):
+        checks["zpool shim unit enabled"] = os.path.islink(
+            "/etc/systemd/system/sysinit.target.wants/fnos-zpool-shim.service")
+    else:
+        checks["zpool shim unit enabled"] = True
+
+    # dirfd shim
+    checks["dirfd shim"] = os.path.exists("/usr/local/sbin/fnos-dirfd-shim.py")
+
+    # trash wrapper
+    checks["trash wrapper so"] = os.path.exists("/usr/local/lib/libfnos-trashshim.so")
+    checks["trash wrapper dropin"] = os.path.exists(
+        "/etc/systemd/system/trim_main.service.d/trashshim.conf")
+
+    # mount shim
+    checks["mount shim"] = os.path.exists("/usr/local/sbin/mount")
+
+    # nic fuse
+    checks["nic fuse script"] = os.path.exists("/usr/local/sbin/fnos-nic-fuse.sh")
+    checks["nic fuse unit enabled"] = os.path.islink(
+        "/etc/systemd/system/sysinit.target.wants/fnos-nic-fuse.service")
+
+    # disk-io opt-in: healthy if unit is baked and (not enabled by default OR opt-in enabled)
+    disk_io_unit_enabled = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-disk-io-monitor.service")
+    checks["disk-io opt-in unit baked"] = os.path.exists(
+        "/etc/systemd/system/fnos-disk-io-monitor.service")
+    checks["disk-io opt-in disabled by default"] = not disk_io_unit_enabled
+
+    # ssh.socket (healthy = not enabled)
+
+    # ssh.socket (healthy = not enabled)
+    checks["ssh.socket not enabled"] = not os.path.islink(
+        "/etc/systemd/system/sockets.target.wants/ssh.socket")
+
+    # nfs-server (healthy = masked)
+    checks["masked: nfs-server.service"] = is_masked("/", "nfs-server.service")
+
+    # wait-online none
+    checks["wait-online none"] = False
+    networking_conf = "/etc/default/networking"
+    if os.path.exists(networking_conf):
+        try:
+            for line in open(networking_conf):
+                if "WAIT_ONLINE_METHOD=none" in line:
+                    checks["wait-online none"] = True
+                    break
+        except (OSError, IOError):
+            pass
+
+    # fstab health
+    fstab_path = "/etc/fstab"
+    checks["fstab healthy"] = True
+    if os.path.exists(fstab_path):
+        try:
+            for line in open(fstab_path):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if ("trimafs" in line or "/boot/efi" in line
+                        or line.split()[1:2] == ["/"]):
+                    checks["fstab healthy"] = False
+                    break
+        except (OSError, IOError):
+            pass
+
+    # liveupdate 补丁改由 AOB 层判定（不再读固定偏移 0x7FE8，1010 上该偏移已失效）
+    lu = None
+    for p in (aob_patches or []):
+        if p.get("id") == "liveupdate.hide-kernel-entry":
+            lu = str(p.get("status", "")).split("(")[0]
+            break
+    if lu is not None:
+        checks["liveupdate patched (AOB)"] = lu in ("already", "applied")
+    else:
+        checks["liveupdate patched (AOB)"] = True  # AOB 层未报告该条目 → 不适用
+
+    # Collect issues (skip disk-io opt-in disabled by default if opt-in is enabled)
+    disk_io_enabled = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-disk-io-monitor.service")
+    for key, val in checks.items():
+        if val is False:
+            if key == "disk-io opt-in disabled by default" and disk_io_enabled:
+                continue
+            issues.append(f"MECH:{key}")
+
+    return {"layer": "mechanism", "ok": len(issues) == 0, "checks": checks,
+            "issues": issues}
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Image pipeline (reuse fnos_patch.py status if available)
+# ---------------------------------------------------------------------------
+
+def detect_image_pipeline():
+    """Check image pipeline patches (subset of mechanism, but explicitly)."""
+    issues = []
+    checks = {}
+
+    # patch set baked
+    import glob
+    patchsets = glob.glob("/usr/local/share/fnos-toolchain/patches/*.json")
+    checks["patch set baked"] = len(patchsets) > 0
+
+    # patch engine baked
+    checks["patch engine baked"] = os.path.exists(
+        "/usr/local/share/fnos-toolchain/aobpatch.py")
+
+    # dirfd unit enabled
+    checks["dirfd unit enabled"] = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-dirfd-shim.service")
+
+    # aob-www unit enabled
+    checks["aob-www unit enabled"] = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-aob-www.service")
+
+    # patch-status timer + patchset fetch + nginx route units enabled
+    checks["patch-status timer enabled"] = os.path.islink(
+        "/etc/systemd/system/timers.target.wants/fnos-patch-status.timer")
+    checks["patchset fetch unit enabled"] = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-patchset-fetch.service")
+    checks["nginx route unit enabled"] = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-nginx-route.service")
+
+    # mountdir unit enabled
+    checks["mountdir unit enabled"] = os.path.islink(
+        "/etc/systemd/system/multi-user.target.wants/fnos-mountdir.service")
+
+    # trim_app_center patched
+    tc_path = "/usr/trim/bin/trim_app_center"
+    if os.path.exists(tc_path):
+        # Check if file has execute permission (patched state indicator)
+        checks["trim_app_center patched"] = os.access(tc_path, os.X_OK)
+    else:
+        checks["trim_app_center patched"] = True  # not applicable
+
+    # LXC 中必然失败的冗余服务必须被 mask（否则重启循环刷屏）：
+    # notify_service=二进制缺失；trim_trashbind=依赖内核设备 /dev/trim-trashbin
+    for u in ("notify_service.service", "trim_trashbind.service", "nfs-server.service"):
+        p = os.path.join("/etc/systemd/system", u)
+        checks["masked: %s" % u] = os.path.islink(p) and os.readlink(p) == "/dev/null"
+
+    # www 资源必须对 nginx 可读：资产被替换成 0600 时 nginx 会整站 403
+    bundle = None
+    try:
+        import glob
+        cands = sorted(glob.glob("/usr/trim/www/assets/index-*.js"))
+        bundle = cands[0] if cands else None
+    except Exception:
+        bundle = None
+    if bundle:
+        checks["www 主资源可读(644)"] = (os.stat(bundle).st_mode & 0o7777) == 0o644
+    else:
+        checks["www 主资源可读(644)"] = True  # 未解压 www → 不适用
+
+    for key, val in checks.items():
+        if val is False:
+            issues.append(f"IMAGE:{key}")
+
+    return {"layer": "image", "ok": len(issues) == 0, "checks": checks,
+            "issues": issues}
+
+
+# ---------------------------------------------------------------------------
+# Notification (PostgreSQL)
+# ---------------------------------------------------------------------------
+
+PROXY_INDEX_PATH = "/run/fnos-updatemgr/index.json"
+SRC_ISSUES = NOTIFY_SOURCE + ".issues"
+SRC_READY = NOTIFY_SOURCE + ".ready"
+
+
+def read_proxy_index():
+    """读 proxy 的索引缓存；不可用返回 None（调用方按 unknown 处理，不误清通知）。"""
+    try:
+        with open(PROXY_INDEX_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def pending_target():
+    """索引中比运行版本更新的最新目标版本 → (ver, entry)；无则 None；索引未知 → 'unknown'。"""
+    idx = read_proxy_index()
+    if idx is None:
+        return "unknown"
+    try:
+        rv = open(VERSION_PATH).read().strip().lstrip("Vv")
+    except OSError:
+        return None
+    vers = (idx.get("versions") or {})
+    newer = [v for v in vers if _vtuple(v) > _vtuple(rv)]
+    if not newer:
+        return None
+    target = max(newer, key=_vtuple)
+    return target, vers[target]
+
+
+def _sql_str(s):
+    return s.replace("'", "''")
+
+
+def _truncate(s, limit=2048):
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _upsert_notify(source, level, title, content):
+    """单事务内 advisory lock + update-in-place（保留已读），无则 insert；并给所有用户补 notify_user 行。"""
+    ts = int(time.time())
+    content = _truncate(content)
+    sql = (
+        "SELECT pg_advisory_xact_lock(hashtext('%s'));"
+        "UPDATE notify SET content='%s', dateandtime=%d WHERE source='%s';"
+        "INSERT INTO notify (cat, level, title, source, content, dateandtime) "
+        "SELECT 0, %d, '%s', '%s', '%s', %d WHERE NOT EXISTS (SELECT 1 FROM notify WHERE source='%s');"
+        "INSERT INTO notify_user (uid, notify_id, read) "
+        "SELECT u.uid, n.id, 0 FROM users u CROSS JOIN notify n "
+        "WHERE n.source='%s' AND NOT EXISTS (SELECT 1 FROM notify_user nu WHERE nu.uid=u.uid AND nu.notify_id=n.id);"
+        % (source, _sql_str(content), ts, source,
+           level, _sql_str(title), source, _sql_str(content), ts, source, source)
+    )
+    rc, _, err = run_cmd(["sudo", "-u", "postgres", "psql", "-d", "trim", "-c", sql], timeout=15)
+    if rc != 0:
+        sys.stderr.write("notify upsert failed for %s: %s\n" % (source, err[:200]))
+        return False
+    return True
+
+
+def _clear_notifies():
+    sql = ("DELETE FROM notify_user WHERE notify_id IN "
+           "(SELECT id FROM notify WHERE source LIKE 'trim.fnos-patch-status%');"
+           "DELETE FROM notify WHERE source LIKE 'trim.fnos-patch-status%';")
+    run_cmd(["sudo", "-u", "postgres", "psql", "-d", "trim", "-c", sql], timeout=15)
+
+
+def notify_postgres(issues, warnings, all_healthy):
+    """纯文本通知：issues/ready 两个 source 原地更新；健康且无更新目标版本时按前缀清理。"""
+    try:
+        target = pending_target()
+        if all_healthy and target is None:
+            _clear_notifies()
+            return True
+        if all_healthy and target == "unknown":
+            return True  # 索引未知：保留现有通知，避免误清
+
+        if not all_healthy:
+            body = "发现 %d 个补丁问题" % len(issues)
+            if issues:
+                body += "；" + "；".join(issues[:20])
+            if warnings:
+                body += "；警告：" + "；".join(warnings[:10])
+            _upsert_notify(SRC_ISSUES, 1, "补丁状态", body)
+        elif target not in (None, "unknown"):
+            # 健康但有更新目标：清掉旧 issues 通知
+            sql = ("DELETE FROM notify_user WHERE notify_id IN (SELECT id FROM notify WHERE source='%s');"
+                   "DELETE FROM notify WHERE source='%s';" % (SRC_ISSUES, SRC_ISSUES))
+            run_cmd(["sudo", "-u", "postgres", "psql", "-d", "trim", "-c", sql], timeout=10)
+
+        if target not in (None, "unknown"):
+            ver, e = target
+            state = str(e.get("status") or "missing")
+            ready, total = e.get("ready"), e.get("total")
+            if state == "ready":
+                body = "补丁集 %s 已就绪（%s/%s）；升级后会自动重新应用。" % (ver, ready, total)
+            elif state == "partial":
+                body = "补丁集 %s 部分就绪（%s/%s）；未命中项升级后会被跳过并记录。" % (ver, ready, total)
+            else:
+                body = "补丁集 %s 尚未就绪；升级后部分补丁可能不可用。" % ver
+            _upsert_notify(SRC_READY, 0, "补丁集就绪状态", body)
+        return True
+    except Exception as e:
+        sys.stderr.write("notify_postgres failed: %s\n" % str(e))
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix
+# ---------------------------------------------------------------------------
+
+def auto_fix(aob_result, mech_result, image_result, allow_live_binary=False):
+    """Attempt to fix missing patches. Returns (fixed_count, failed_count, skipped_list).
+
+    Auto-fix policy (best-effort):
+      - 文本/www 补丁（ready / ready-unverified）：立即 aobpatch apply --only text
+      - 二进制补丁：默认只报告"留待下次开机"；--allow-live-binary 才应用并重启 trim_main
+      - skipped / 未知哈希：记录跳过原因，不阻塞其他项
+      - 机制补丁中容器内可修的：直接修
+    """
+    fixed = 0
+    failed = 0
+    skipped = []
+
+    # Layer 1: AOB patches
+    ready_aob = []
+    ready_text = []
+    for p in aob_result.get("patches", []):
+        status = str(p.get("status", "")).split("(")[0]
+        pid = p.get("id", "")
+        pfile = p.get("file", "")
+        if status in ("ready", "ready-unverified"):
+            if "www/" in pfile or "assets/" in pfile:
+                ready_text.append(pid)
+            else:
+                ready_aob.append(pid)
+        elif status == "skipped":
+            skipped.append("AOB:%s (skipped: %s)" % (pid, p.get("reason", "")))
+
+    mode, patchset = select_patchset()
+    if patchset is None:
+        skipped.append("AOB:no-compatible-patchset (文本以外不自动修复)")
+    else:
+        def apply_ids(only, ids, timeout):
+            cmd = [sys.executable, AOBPATCH, "apply", "--rootfs", "/", "--patchset", patchset,
+                   "--best-effort", "--only", only]
+            if mode == "fallback":
+                cmd.append("--fallback")
+            for pid in ids:
+                cmd += ["--patch-id", pid]
+            rc, out, err = run_cmd(cmd, timeout=timeout)
+            try:
+                data = json.loads(out)
+            except (json.JSONDecodeError, ValueError):
+                return 0, len(ids), "apply 输出非 JSON (rc=%s): %s" % (rc, err[:120])
+            got = [p for p in data.get("patches", []) if p.get("id") in ids]
+            n_ok = sum(1 for p in got if str(p.get("status", "")).split("(")[0] in ("applied", "already"))
+            return n_ok, len(ids) - n_ok, None
+
+        if ready_text:
+            n_ok, n_bad, err = apply_ids("text", ready_text, 180)
+            fixed += n_ok; failed += n_bad
+            if err:
+                skipped.append("AOB:text " + err)
+        if ready_aob:
+            if allow_live_binary:
+                # live 替换 libnfile/libnperm/libtrimacl 后，必须重启**所有**消费者
+                # （doc 35: dlcenter trim_access EBADF；doc 36: file.rm 误判 mountpoint）
+                wrapper = "/usr/local/sbin/fnos-dirfd-shim.py"
+                if os.path.exists(wrapper):
+                    rc, out, err = run_cmd([sys.executable, wrapper, "apply", "--only", "aob",
+                                            "--restart-consumers", "--best-effort"], timeout=900)
+                    if rc == 0:
+                        fixed += len(ready_aob)
+                        skipped.append("AOB:已通过 wrapper 应用二进制补丁并重启 lib 消费者服务")
+                    else:
+                        failed += len(ready_aob)
+                        skipped.append("AOB:wrapper 应用失败: %s" % err[:200])
+                else:
+                    n_ok, n_bad, err = apply_ids("aob", ready_aob, 600)
+                    fixed += n_ok; failed += n_bad
+                    if err:
+                        skipped.append("AOB:aob " + err)
+                    if n_ok:
+                        run_cmd(["systemctl", "restart", "trim_main"], timeout=60)
+                        skipped.append("AOB:已重启 trim_main（无 wrapper，消费者清单不可用）")
+            else:
+                skipped.extend("AOB:%s (binary deferred to next boot; --allow-live-binary to force)" % pid
+                               for pid in ready_aob)
+
+    # Layer 2: mechanism patches (container-fixable)
+    checks = mech_result.get("checks", {})
+
+    # zpool shim
+    if not checks.get("zpool shim", True):
+        try:
+            zpool_real = "/sbin/zpool.real"
+            zpool_path = "/sbin/zpool"
+            if not os.path.exists(zpool_real) and os.path.exists(zpool_path):
+                os.rename(zpool_path, zpool_real)
+            shim_content = """#!/bin/sh
+# zpool shim for fnOS in LXC container
+echo '{"pools":[]}'
+exit 0
+"""
+            with open(zpool_path, "w") as f:
+                f.write(shim_content)
+            os.chmod(zpool_path, 0o755)
+            fixed += 1
+        except (OSError, IOError):
+            failed += 1
+
+    # pg backup dir
+    if not checks.get("pg backup dir", True):
+        try:
+            os.makedirs("/var/backups/postgresql", exist_ok=True)
+            fixed += 1
+        except (OSError, IOError):
+            failed += 1
+
+    # pg hba replication entry
+    if not checks.get("pg hba replication entry", True):
+        pg_dir = "/etc/postgresql"
+        added = False
+        for v in os.listdir(pg_dir):
+            pg_hba = os.path.join(pg_dir, v, "main", "pg_hba.conf")
+            if os.path.exists(pg_hba):
+                try:
+                    with open(pg_hba, "a") as f:
+                        f.write("\n# fnos-patch-status: replication entry\n")
+                        f.write("local   replication     postgres                                trust\n")
+                    added = True
+                except (OSError, IOError):
+                    pass
+        if added:
+            fixed += 1
+        else:
+            failed += 1
+
+    # dirfd shim / mount shim / nic fuse / trash wrapper:
+    # these require host-side scripts or file copies not available in-container
+    for check_key, label in [
+        ("dirfd shim", "dirfd shim"),
+        ("mount shim", "mount shim"),
+        ("nic fuse script", "nic fuse"),
+        ("trash wrapper so", "trash wrapper"),
+        ("trash wrapper dropin", "trash wrapper dropin"),
+    ]:
+        if not checks.get(check_key, True):
+            skipped.append("MECH:%s (requires host-side script)" % label)
+
+    # Layer 3: image pipeline — units enabled
+    ichecks = image_result.get("checks", {})
+    for unit_name, check_key in [
+        ("fnos-dirfd-shim.service", "dirfd unit enabled"),
+        ("fnos-aob-www.service", "aob-www unit enabled"),
+        ("fnos-mountdir.service", "mountdir unit enabled"),
+    ]:
+        if not ichecks.get(check_key, True):
+            rc, _, _ = run_cmd(["systemctl", "enable", unit_name], timeout=10)
+            if rc == 0:
+                fixed += 1
+            else:
+                failed += 1
+
+    return fixed, failed, skipped
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="fnOS patch status detector")
+    parser.add_argument("--json", action="store_true",
+                        help="Output JSON")
+    parser.add_argument("--table", action="store_true",
+                        help="Output human-readable table (default)")
+    parser.add_argument("--log", action="store_true",
+                        help="Write to journalctl and log file")
+    parser.add_argument("--notify", action="store_true",
+                        help="Create/update WebUI notification")
+    parser.add_argument("--auto-fix", action="store_true",
+                        help="Automatically fix missing patches (text only; binary deferred to next boot)")
+    parser.add_argument("--allow-live-binary", action="store_true",
+                        help="With --auto-fix: also apply binary patches live and restart trim_main")
+    parser.add_argument("--exit-code", action="store_true",
+                        help="Exit with non-zero on issues (default behavior)")
+    args = parser.parse_args()
+
+    # Run detection
+    import sys as _dbg
+    _dbg.stderr.write('DEBUG: starting detect_aob\n'); _dbg.stderr.flush()
+    aob = detect_aob()
+    _dbg.stderr.write('DEBUG: detect_aob done\n'); _dbg.stderr.flush()
+    _dbg.stderr.write('DEBUG: starting detect_mechanism\n'); _dbg.stderr.flush()
+    mech = detect_mechanism(aob.get("patches"))
+    _dbg.stderr.write('DEBUG: detect_mechanism done\n'); _dbg.stderr.flush()
+    _dbg.stderr.write('DEBUG: starting detect_image\n'); _dbg.stderr.flush()
+    image = detect_image_pipeline()
+    _dbg.stderr.write('DEBUG: detect_image done\n'); _dbg.stderr.flush()
+
+    all_issues = aob.get("issues", []) + mech.get("issues", []) + image.get("issues", [])
+    all_healthy = len(all_issues) == 0
+
+    result = {
+        "healthy": all_healthy,
+        "issue_count": len(all_issues),
+        "issues": all_issues,
+        "layers": {
+            "aob": {"ok": aob.get("ok", False), "phase": aob.get("phase", "unknown"),
+                    "patch_count": len(aob.get("patches", [])),
+                    "issue_count": len(aob.get("issues", []))},
+            "mechanism": {"ok": mech.get("ok", False),
+                          "check_count": len(mech.get("checks", {})),
+                          "issue_count": len(mech.get("issues", []))},
+            "image": {"ok": image.get("ok", False),
+                      "check_count": len(image.get("checks", {})),
+                      "issue_count": len(image.get("issues", []))},
+        },
+        "timestamp": int(time.time()),
+    }
+
+    # Auto-fix
+    if args.auto_fix and not all_healthy:
+        fixed, failed, skipped = auto_fix(aob, mech, image, allow_live_binary=args.allow_live_binary)
+        result["auto_fix"] = {"fixed": fixed, "failed": failed,
+                              "skipped": skipped}
+        # Re-run detection
+        aob = detect_aob()
+        mech = detect_mechanism(aob.get("patches"))
+        image = detect_image_pipeline()
+        all_issues = aob.get("issues", []) + mech.get("issues", []) + image.get("issues", [])
+        all_healthy = len(all_issues) == 0
+        result["healthy"] = all_healthy
+        result["issue_count"] = len(all_issues)
+        result["issues"] = all_issues
+        result["layers"]["aob"]["ok"] = aob.get("ok", False)
+        result["layers"]["mechanism"]["ok"] = mech.get("ok", False)
+        result["layers"]["image"]["ok"] = image.get("ok", False)
+
+    # Output
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        # Table output
+        print("=" * 60)
+        print("fnOS Patch Status Report")
+        print("=" * 60)
+        print("Timestamp: %s" % time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(result["timestamp"])))
+        print()
+        print("Layer 1 (AOB):      %s (%d patches, %d issues)" % (
+            "OK" if result["layers"]["aob"]["ok"] else "ISSUES",
+            result["layers"]["aob"]["patch_count"],
+            result["layers"]["aob"]["issue_count"]))
+        print("Layer 2 (Mechanism): %s (%d checks, %d issues)" % (
+            "OK" if result["layers"]["mechanism"]["ok"] else "ISSUES",
+            result["layers"]["mechanism"]["check_count"],
+            result["layers"]["mechanism"]["issue_count"]))
+        print("Layer 3 (Image):     %s (%d checks, %d issues)" % (
+            "OK" if result["layers"]["image"]["ok"] else "ISSUES",
+            result["layers"]["image"]["check_count"],
+            result["layers"]["image"]["issue_count"]))
+        print()
+        if all_issues:
+            print("Issues:")
+            for issue in all_issues:
+                print("  - %s" % issue)
+        else:
+            print("All patches healthy.")
+        if "auto_fix" in result:
+            af = result["auto_fix"]
+            print()
+            print("Auto-fix: %d fixed, %d failed, %d skipped" % (
+                af["fixed"], af["failed"], len(af.get("skipped", []))))
+            for sk in af.get("skipped", []):
+                print("  SKIP: %s" % sk)
+        print("=" * 60)
+
+    # Log
+    if args.log:
+        log_line = "[%s] fnos-patch-status: %s (%d issues)" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            "HEALTHY" if all_healthy else "ISSUES",
+            len(all_issues))
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(log_line + "\n")
+                if all_issues:
+                    for issue in all_issues:
+                        f.write("  - %s\n" % issue)
+        except (OSError, IOError):
+            pass
+        # journalctl via logger (systemd-cat may hang)
+        run_cmd(["logger", "-t", "fnos-patch-status", log_line], timeout=5)
+
+    # Notify
+    if args.notify:
+        notify_postgres(all_issues, aob.get("warnings", []), all_healthy)
+
+    # Exit code
+    if args.exit_code or True:  # always use exit code contract
+        sys.exit(0 if all_healthy else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,7 @@ TC="$(dirname "$HERE")"
 PY="${PYTHON:-python3}"
 
 "$PY" - "$TC" <<'PYEOF'
-import sys, os, types, tempfile, json, glob as _glob
+import sys, os, types, tempfile, json, hashlib, glob as _glob
 def newest_patchset():
     cands = sorted(_glob.glob(os.path.join(TC, "patches", "fnos-*.json")))
     assert cands, "toolchain 内无补丁集"
@@ -154,13 +154,47 @@ try:
 finally:
     P.run = orig_run
 
+# 10) ssh.socket 启用软链清理 + 状态门（fnos-lxc-ssh-socket-fix）
+sd = tempfile.mkdtemp(prefix="pipe-sshfix-")
+try:
+    sr = os.path.join(sd, "rootfs-dirty")
+    os.makedirs(os.path.join(sr, "usr/trim/etc"))
+    open(os.path.join(sr, "usr/trim/etc/version"), "w").write("1.2.0800")
+    # trim_app_center 状态门（appcenter-tpk-perm D5）：假树带假二进制 +
+    # 补丁集声明 patched=其哈希，保持"修复后全 true"契约可测
+    os.makedirs(os.path.join(sr, "usr/trim/bin"))
+    open(os.path.join(sr, "usr/trim/bin/trim_app_center"), "w").write("terminal")
+    th = hashlib.sha256(b"terminal").hexdigest()
+    wants = os.path.join(sr, "etc/systemd/system/sockets.target.wants")
+    os.makedirs(wants)
+    os.symlink("/lib/systemd/system/ssh.socket", os.path.join(wants, "ssh.socket"))
+    eps = os.path.join(sd, "empty-patchset.json")
+    json.dump({"fnos_version": "1.2.0800", "patches": [],
+               "file_hashes": {"usr/trim/bin/trim_app_center":
+                               {"orig": "0", "patched": th}}}, open(eps, "w"))
+    shim_stub = os.path.join(sd, "mount-shim-stub"); open(shim_stub, "w").write("#!/bin/sh\n")
+    (ok if fnos_patch.status(sr).get("ssh.socket not enabled") is False else no)("ssh.socket：带软链 rootfs 检查项 False")
+    a_ssh = ns(rootfs=sr, patchset=eps, shim=shim_stub, force=False, no_version_check=False)
+    rc_ssh = P.stage_patch(a_ssh)
+    (ok if (rc_ssh == 0 and not os.path.lexists(os.path.join(wants, "ssh.socket"))) else no)("stage_patch：False→修复→软链移除且整体转绿 (rc=%d)" % rc_ssh)
+    rc_ssh2 = P.stage_patch(a_ssh)
+    (ok if rc_ssh2 == 0 else no)("stage_patch 幂等：修复后二次运行全绿跳过")
+    sr2 = os.path.join(sd, "rootfs-clean")
+    os.makedirs(os.path.join(sr2, "usr/trim/etc"))
+    open(os.path.join(sr2, "usr/trim/etc/version"), "w").write("1.2.0800")
+    (ok if fnos_patch.status(sr2).get("ssh.socket not enabled") is True else no)("ssh.socket：本无软链直接 True")
+    log_absent = fnos_patch.apply(sr2, eps, shim_stub, enforce_version=False)
+    (ok if any("absent" in l for l in log_absent) else no)("ssh.socket：无软链 apply 记 absent（幂等）")
+finally:
+    import shutil as _sh2; _sh2.rmtree(sd, ignore_errors=True)
+
 print()
 print("== pipeline_test: PASS=%d FAIL=%d ==" % (pass_n, fail_n))
 sys.exit(1 if fail_n else 0)
 PYEOF
 py_rc=$?
 
-echo "== 10) 缺省回潮回归（任一缺省重新指向具体旧版本即失败） =="
+echo "== 11) 缺省回潮回归（任一缺省重新指向具体旧版本即失败） =="
 rg_rc=0
 # argparse 缺省禁止出现旧版本字面量（docstring 示例除外，只查 default= 行）
 if grep -rn 'default=.*1\.2\.0701' "$TC"/*.py | grep -v tests/; then

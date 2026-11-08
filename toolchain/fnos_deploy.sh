@@ -21,7 +21,7 @@ STORAGE="${STORAGE:-}"; SIZE=12; IMAGE=""; HOSTNAME_="fnos-lxc"
 CPUS=2; MEM=2048; NO_START=0; JSON_OUT=0
 # 镜像内需 mask 的单元（与 fnos_patch.py 的 MASK_UNITS 保持一致；空格分隔）
 # nfsd 是宿主内核全局态，容器内跑 nfs-server 会直接在宿主起 rpc.nfsd 并与其它实例互踩。
-MASK_UNITS="nfs-server.service"
+MASK_UNITS="nfs-server.service notify_service.service trim_trashbind.service"
 # 网络 IP：默认 DHCP；可设静态以避开被网关屏蔽的 IP（见 README「静态 IP / WAN 出口」）。
 #   形式同 PVE net0： "<addr>/<mask>" 或 "<addr>/<mask>,gw=<gw>"。例：
 #   FNOS_CT_IP="192.168.199.199/24,gw=192.168.199.1" fnos_deploy.sh install 201
@@ -294,16 +294,32 @@ smoke() {
   chk "postgresql active (=$a)" "$([ "$a" = active ] && echo 1 || echo 0)"
   r="$(pct exec "$id" -- systemctl is-active resmon_service 2>/dev/null || true)"
   chk "resmon_service active (=$r)" "$([ "$r" = active ] && echo 1 || echo 0)"
-  rp="$(pct exec "$id" -- python3 -c 'd=open("/usr/trim/bin/resmon_service","rb").read();print(1 if d[0x11b6c8:0x11b6d1]==bytes.fromhex("31c0900f84a7070000") else 0)' 2>/dev/null || echo 0)"
-  chk "resmon 已打 veth-kind 补丁（resmon.net 流量可用）" "$rp"
+  # resmon veth-kind 补丁：按 AOB 补丁集状态判定（写死偏移只对 0800 有效，1010 已改址）
+  rp="$(pct exec "$id" -- python3 -c 'import glob,json,subprocess,sys
+ps=sorted(glob.glob("/usr/local/share/fnos-toolchain/patches/fnos-*.json"))
+if not ps: print(0); sys.exit()
+r=subprocess.run([sys.executable,"/usr/local/share/fnos-toolchain/aobpatch.py","check","--rootfs","/","--patchset",ps[-1],"--only","aob","--best-effort"],capture_output=True,text=True)
+try: d=json.loads(r.stdout)
+except Exception: print(0); sys.exit()
+st={p["id"]:str(p.get("status","")).split("(")[0] for p in d.get("patches",[])}
+print(1 if any(k.startswith("resmon_service.veth-kind") and v in ("already","applied") for k,v in st.items()) else 0)' 2>/dev/null || echo 0)"
+  chk "resmon 已打 veth-kind 补丁（AOB 状态判定，resmon.net 流量可用）" "$rp"
   # 磁盘 I/O 监控：opt-in 补丁，默认不生效。仅烘焙单元、按需 enable（CT201 已启用）。
   pct exec "$id" -- test -f /etc/systemd/system/fnos-disk-io-monitor.service \
     && chk "磁盘 I/O opt-in 单元已烘焙" 1 || chk "磁盘 I/O opt-in 单元已烘焙" 0
   dku="$(pct exec "$id" -- systemctl is-enabled fnos-disk-io-monitor.service 2>/dev/null || echo '')"
   if [ "$dku" = enabled ]; then
-    dh="$(pct exec "$id" -- sha256sum /usr/trim/bin/resmon_service 2>/dev/null | awk '{print $1}')"
-    chk "磁盘 I/O opt-in 已启用 + resmon 已打 disk-io 补丁 (sha=231f…)" \
-        "$([ "$dh" = 231f239460c7e6d3bd75e54040f762e953766a403b18cc9e2b3c47089c80e5ee ] && echo 1 || echo 0)"
+    # 磁盘 I/O 补丁应用状态同样按 AOB 判定（不同版本补丁集哈希不同，写死 sha 会误报）
+    dh="$(pct exec "$id" -- python3 -c 'import glob,json,subprocess,sys
+ps=sorted(glob.glob("/usr/local/share/fnos-toolchain/patches/fnos-*.json"))
+if not ps: print(0); sys.exit()
+r=subprocess.run([sys.executable,"/usr/local/share/fnos-toolchain/aobpatch.py","check","--rootfs","/","--patchset",ps[-1],"--only","aob","--best-effort","--include-disabled"],capture_output=True,text=True)
+try: d=json.loads(r.stdout)
+except Exception: print(0); sys.exit()
+st={p["id"]:str(p.get("status","")).split("(")[0] for p in d.get("patches",[])}
+print(1 if any("disk-io" in k and v in ("already","applied") for k,v in st.items()) else 0)' 2>/dev/null || echo 0)"
+    chk "磁盘 I/O opt-in 已启用 + resmon disk-io 补丁已应用（AOB 状态判定）" \
+        "$([ "$dh" = 1 ] && echo 1 || echo 0)"
   else
     echo "  INFO: 磁盘 I/O 监控默认关闭（opt-in 未启用；启用见 README「磁盘 I/O 监控」）"
   fi

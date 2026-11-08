@@ -1,0 +1,25 @@
+# 使用 libnfile.so / libnperm.so / libtrimacl.so 的服务（live 替换这些库后必须重启）
+#
+# 背景（doc 35 / doc 36）：
+#   - libnperm.so 的 trim_access 用魔数 dirfd(0xFFFFABAE)，未 patch 时 dlcenter
+#     的 getDirFreeSpace/addUris 全部 EBADF → errno 50331650。
+#   - libnfile.so 的 is_mountpoint/trim_realpath 用魔数 dirfd，未 patch 时
+#     file.rm 把 EBADF 误判成"挂载点" → errno 327696。
+#   修法都是"补丁已生效但进程仍持旧 inode"：os.replace 换掉文件后，**已运行的
+#   进程继续用旧 inode**，必须重启所有链接该库的服务才真正生效。
+#
+# 开机重放（fnos-dirfd-shim.service，Before=trim_main）不需要本清单——此时这些
+# 服务尚未起来；live 应用（--allow-live-binary / 手工 apply --restart-consumers）
+# 才需要。
+trim_main.service
+dlcenter.service
+filestor_service.service
+share_service.service
+sysrestore.service
+backup_service.service
+eventlogger_service.service
+finder_service.service
+imagesrv.service
+trim_upload.service
+webdav.service
+trim_app_center.service

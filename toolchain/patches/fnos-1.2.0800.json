@@ -705,12 +705,79 @@
       "expect": 1,
       "disabled": true,
       "disabled_reason": "disabled (opt-in available)"
+    },
+    {
+      "id": "trim_app_center#tpk-walk-0644->0755",
+      "kind": "aob",
+      "file": "usr/trim/bin/trim_app_center",
+      "match": "b9 a4 01 00 00 e8",
+      "replace": [
+        {
+          "find": "a4 01",
+          "to": "ed 01"
+        }
+      ],
+      "expect": 1,
+      "note": "tpk 解包 chmod(app-user, 0644) → 0755：保留搜索位，使 setuid 后 exec install_init 在 stock kernel DAC 下通过（fnOS 内核 trim-ACL 依赖）"
+    },
+    {
+      "id": "trim_app_center#downloads-mkdir-0750->0755",
+      "kind": "aob",
+      "file": "usr/trim/bin/trim_app_center",
+      "match": "8b 5c 24 38 b9 e8 01 00 00",
+      "replace": [
+        {
+          "find": "e8 01",
+          "to": "ed 01"
+        }
+      ],
+      "expect": 1,
+      "note": "/vol*/appcenter-downloads MkdirAll(0750 root:root) → 0755：WebUI/网页上传走 /vol1 下载目录，无 trim-ACL 时普通位不够（web 用户仅 Other 位）"
+    },
+    {
+      "id": "libtrimacl.so.4c89fe->498b37#26",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "e1 31 d2 4c 89 fe c7 00 00",
+      "replace": [
+        {
+          "find": "4c89fe",
+          "to": "498b37"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libtrimacl.so.4c89fe->498b37#27",
+      "file": "usr/trim/lib/libtrimacl.so",
+      "match": "c0 74 5c 4c 89 fe bf ?? ?? ?? ??",
+      "replace": [
+        {
+          "find": "4c89fe",
+          "to": "498b37"
+        }
+      ],
+      "expect": 1
+    },
+    {
+      "id": "libnfile.so.4889e6->4889de#5",
+      "file": "usr/trim/lib/libnfile.so",
+      "match": "cc 31 d2 48 89 e6 66 0f 6c",
+      "replace": [
+        {
+          "find": "4889e6",
+          "to": "4889de"
+        }
+      ],
+      "expect": 1
     }
   ],
   "file_hashes": {
     "usr/trim/lib/libnfile.so": {
       "orig": "46d45a7425904cda1cc092c0f69bf0ff3faf860ad27723668d7d15375af04135",
-      "patched": "de720992710831a6bfbada212ff32949ba70630397933731e81aa49a1cc45fe9"
+      "patched": [
+        "de720992710831a6bfbada212ff32949ba70630397933731e81aa49a1cc45fe9",
+        "588f6b485fb09263c15d30aa8a01b570176ee41e5e0bff5db38eb3addba84421"
+      ]
     },
     "usr/trim/lib/libnperm.so": {
       "orig": "4b36c1e9e718428b338815f5bc8606ebad004e6dfc496162de1d206e423b29e8",
@@ -718,7 +785,10 @@
     },
     "usr/trim/lib/libtrimacl.so": {
       "orig": "e22e64442b32a9a3dd4e453897d516b9ac3b79c5e718b5b5aab4f2f2c23ee9d7",
-      "patched": "cb7690bbd41e1e355162ea61b8d0431eab9c1629d1346d41a01119bbf251b265"
+      "patched": [
+        "cb7690bbd41e1e355162ea61b8d0431eab9c1629d1346d41a01119bbf251b265",
+        "060eff791c2be494dd8c877bde76506a4665e57c7b9d64eb9e43cca4f0658044"
+      ]
     },
     "usr/trim/bin/filemanager": {
       "orig": "6d1bbffdd06b9fc0cc103991ad992d330fd9679df125d42bd2542729f2e9d96e",
@@ -734,6 +804,10 @@
         "9a5af10e65a07729f78cacb7583515fb3db16f7a6a421e78cef390b2a22c21ec",
         "231f239460c7e6d3bd75e54040f762e953766a403b18cc9e2b3c47089c80e5ee"
       ]
+    },
+    "usr/trim/bin/trim_app_center": {
+      "orig": "f932a2a661a56b0b4cd181ddf1a036b0b79289978df5745e3e8497012d2e033f",
+      "patched": "92b3195b1fd9bf87d8be6f2abcb318981267bcc481ddb7c53cea9156579ea14a"
     }
   }
 }

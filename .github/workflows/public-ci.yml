@@ -156,6 +156,9 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       patchset: ${{ steps.patchset-gate.outputs.patchset }}
+      ready: ${{ steps.check.outputs.ready }}
+      total: ${{ steps.check.outputs.total }}
+      patchset_sha256: ${{ steps.check.outputs.patchset_sha256 }}
     env:
       VERSION: ${{ needs.detect.outputs.version }}
       BRANCH: ${{ needs.detect.outputs.branch }}
@@ -285,6 +288,17 @@ jobs:
             --patchset "toolchain/patches/fnos-${ver#V}.json" \
             --report "$RUNNER_TEMP/patch-report.json"
           cat "$RUNNER_TEMP/patch-report.json"
+          # 输出 ready/total/sha256，供 release job 校验索引与 validation 一致
+          python3 -c "
+          import json, os
+          d = json.load(open(os.environ['RUNNER_TEMP'] + '/patch-report.json'))
+          ps = d.get('patches', [])
+          ok = ('ready', 'already')
+          ready = sum(1 for p in ps if str(p.get('status', '')).split('(')[0] in ok)
+          print('ready=%d' % ready)
+          print('total=%d' % len(ps))
+          print('patchset_sha256=%s' % (d.get('patchset_sha256') or ''))
+          " >> "$GITHUB_OUTPUT"
 
       - name: patch apply + mkraw + fsck
         if: steps.patchset-gate.outputs.patchset == 'ok' && steps.check.outcome == 'success'
@@ -421,11 +435,49 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: 发布补丁集到 Release
+      - name: 生成并校验就绪索引（与 build 的 check 报告一致）
         run: |
           ver="${GITHUB_REF#refs/tags/v}"
-          gh release create "v$ver" \
-            "toolchain/patches/fnos-$ver.json" \
-            --title "patchset $ver" --generate-notes
+          ps="toolchain/patches/fnos-$ver.json"
+          [ -f "$ps" ] || { echo "patchset missing in tag: $ps"; exit 1; }
+          python3 - "$ps" <<'PY'
+          import json, hashlib, sys, os, datetime
+          ps_path = sys.argv[1]
+          raw = open(ps_path, 'rb').read()
+          ps = json.loads(raw)
+          val = ps.get('validation') or {}
+          ver = str(ps.get('fnos_version', '')).lstrip('Vv')
+          ready, total = val.get('ready'), val.get('total')
+          idx = {"revision": 1,
+                 "generated": datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                 "versions": {ver: {"patchset": os.path.basename(ps_path),
+                                    "sha256": hashlib.sha256(raw).hexdigest(),
+                                    "ready": ready, "total": total,
+                                    "status": "ready" if ready == total else "partial",
+                                    "validated_at": val.get('validated_at')}}}
+          json.dump(idx, open('toolchain/patches/index.json', 'w'), ensure_ascii=False, indent=2)
+          print('index:', idx['versions'][ver])
+          PY
+          python3 toolchain/tests/validate-index.py --index toolchain/patches/index.json
+          # 严格路径：validation 计数必须与 build 阶段 aobpatch check 的报告一致
+          if [ -n "${{ needs.build.outputs.ready }}" ]; then
+            v_ready=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['ready'])")
+            v_total=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['total'])")
+            if [ "$v_ready" != "${{ needs.build.outputs.ready }}" ] || [ "$v_total" != "${{ needs.build.outputs.total }}" ]; then
+              echo "validation ($v_ready/$v_total) != patch-report (${{ needs.build.outputs.ready }}/${{ needs.build.outputs.total }})"; exit 1
+            fi
+          fi
+          # sha256 必须与 build 阶段报告一致
+          if [ -n "${{ needs.build.outputs.patchset_sha256 }}" ]; then
+            actual=$(sha256sum "$ps" | awk '{print $1}')
+            if [ "$actual" != "${{ needs.build.outputs.patchset_sha256 }}" ]; then
+              echo "patchset sha256 mismatch: $actual != ${{ needs.build.outputs.patchset_sha256 }}"; exit 1
+            fi
+          fi
+      - name: 幂等发布补丁集与索引到 Release（单 job 串行 clobber）
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          gh release view "v$ver" >/dev/null 2>&1 || gh release create "v$ver" --title "patchset $ver" --generate-notes
+          gh release upload "v$ver" "toolchain/patches/fnos-$ver.json" "toolchain/patches/index.json" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

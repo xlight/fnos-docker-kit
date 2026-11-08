@@ -174,7 +174,10 @@ ensure_stack() {
   log "栈建成：MD=$MD_DEV VG=$VG LV=$DM_DEV"
 }
 
-# ---------- 4) 容器透传（devN + bind + cgroup allow）----------
+# ---------- 4) 容器透传（devN + cgroup allow + 静态节点 unit；file bind 已退役）----------
+# 变更史（2026-10-17，fnos-ct-guard）：file bind 会被容器内 fnOS 的 umount 摘掉
+# （写入落 stub，见 07 §13.1）；节点改由开机 unit 静态 mknod。md 设备的 cgroup
+# 只读行归 fnos-ct-guard 管（本脚本只清旧 rw 行，不再发射）。
 ensure_passthrough() {
   load_state
   local md_mm dm_mm nv_mm mdn dmn
@@ -185,9 +188,13 @@ ensure_passthrough() {
   md_mm="$(cat "/sys/class/block/$mdn/dev" 2>/dev/null)"
   dm_mm="$(cat "/sys/class/block/$dmn/dev" 2>/dev/null)"
   nv_mm="$(cat "/sys/class/block/${NVME_DEV}p1/dev" 2>/dev/null)"
+  local v
+  for v in "md:$md_mm" "dm:$dm_mm" "nvme:${nv_mm}"; do
+    [ -n "${v##*:}" ] || die "读不到 ${v%%:*} 号段（$mdn/$dmn/${NVME_DEV}p1），拒绝写半截配置"
+  done
   local C="/etc/pve/lxc/${CTID}.conf"
-  # 清掉旧的本方案行——按我们生成的**精确整行**删除（旧正则要求名字后紧跟空格，
-  # 对 md125/dm-5/nvme1n1p1 这类带数字的名字失配，导致每次 create 都重复累积）
+  # 清理：本方案旧行（含退役 bind）、旧 md cgroup rw 行（只读行由 fnos-ct-guard 管）。
+  # 按精确整行删除（旧正则对 md125/dm-5/nvme1n1p1 这类带数字的名字会失配）。
   local tmp; tmp="$(mktemp)"
   grep -vFx \
     -e "dev${DEVID}: ${DM_DEV}" \
@@ -203,22 +210,20 @@ ensure_passthrough() {
   cat "$tmp" > "$C"; rm -f "$tmp"
   {
     echo "dev${DEVID}: ${DM_DEV}"
-    echo "lxc.cgroup2.devices.allow: b ${md_mm} rw"
-    echo "lxc.mount.entry: /dev/${mdn} dev/${mdn} none bind,optional,create=file"
     echo "lxc.cgroup2.devices.allow: b ${dm_mm} rw"
-    echo "lxc.mount.entry: /dev/${dmn} dev/${dmn} none bind,optional,create=file"
     echo "lxc.cgroup2.devices.allow: b ${nv_mm} rw"
-    echo "lxc.mount.entry: /dev/${NVME_DEV}p1 dev/${NVME_DEV}p1 none bind,optional,create=file"
+    if [ "${VOLFS:-ext4}" = "zfs" ]; then echo "lxc.cgroup2.devices.allow: c 10:249 rw"; fi
   } >> "$C"
-  # zfs 卷：透传 /dev/zfs（容器内 fnOS 需 zfs 工具才能挂 zfs 卷）
-  if [ "${VOLFS:-ext4}" = "zfs" ]; then
-    echo "lxc.cgroup2.devices.allow: c 10:249 rw" >> "$C"
-    echo "lxc.mount.entry: /dev/zfs dev/zfs none bind,optional,create=file" >> "$C"
-  fi
-  log "透传：dev${DEVID}=${DM_DEV} + binds(${mdn},${dmn},${NVME_DEV}p1)${VOLFS:+ [fs=$VOLFS]}"
+  # 容器内静态节点 unit（md/dm/nvme 成员 [+zfs 字符节点]）
+  local nargs="${mdn} ${dmn} ${NVME_DEV} ${NVME_DEV}p1"
+  if [ "${VOLFS:-ext4}" = "zfs" ]; then nargs="$nargs c:zfs"; fi
+  # shellcheck disable=SC2086
+  ct_node_unit_ensure "$CTID" "fnos-stornode-${CTID}.service" "/usr/local/sbin/fnos-stornode.sh" \
+    "fnOS storage stack static nodes (CT${CTID}: md/dm/nvme)" $nargs
+  log "透传：dev${DEVID}=${DM_DEV} + cgroup(dm=${dm_mm},nvme=${nv_mm}) + nodes(${nargs})"
 }
 
-# ---------- 5) /sys/block 动态屏蔽 ----------
+# ---------- 5) /sys/block 动态屏蔽（stor-mask.sh apply=并集：不摘除其它栈已暴露设备） ----------
 ensure_mask() {
   load_state
   local mdn dmn; mdn="$(basename "$MD_DEV")"; dmn="$(basename "$(readlink -f "$DM_DEV")")"
@@ -316,6 +321,7 @@ After=zfs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Environment=CTID=${CTID}
 ExecStart=${SCRIPT_DIR}/stor-manage.sh up
 [Install]
 WantedBy=multi-user.target
@@ -333,13 +339,15 @@ do_create() {
   manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"create","ctid":%s,"vg":"%s","md":"%s","lv":"%s"}' "$(date -Is)" "$CTID" "${VG:-}" "${MD_DEV:-}" "${DM_DEV:-}")"
   log "create 完成；重启容器生效：pct reboot $CTID"
 }
-do_up() {   # 自愈：确保 zvol/nvme/栈/屏蔽/透传 都在（幂等）
+do_up() {   # 自愈：确保 zvol/nvme/栈/透传/屏蔽/自身 unit 都在（幂等；容器未运行时容器侧落装自动跳过）
   need_root
   load_state
   ensure_zvol || exit 0
   ensure_nvme  || exit 0
   ensure_stack || exit 0
+  ( ensure_passthrough ) || warn "透传确保未完成（state 或容器状态异常，详见上方日志）"
   ensure_mask  || true
+  ensure_unit  || true
   log "up 完成"
 }
 # ---------- 0) destroy 护栏：卷上有应用数据时默认拒绝 ----------

@@ -17,6 +17,9 @@
 #   3) 人为改动（由 match 派生）-> 失败即停（退出非 0 且不写任何文件）
 #   4) 版本不符 -> 构建拒绝
 #   5) 报告含补丁集版本 + 每条输入哈希（text 用 files[].input_sha256）
+#   6) tpk-perm 新条目定向（appcenter-tpk-perm）：锚点失败即停 + expect-mismatch 失败即停
+#
+# 注意：trim_app_center 约 103MB，纯 Python 特征扫描每条 ~1 分钟，全程预计 ~15 分钟。
 #
 # 用法: bash tests/selftest.sh
 # ============================================================================
@@ -97,6 +100,8 @@ mk_tree() {
   cp "$FIXTURE/filemanager"      "$t/usr/trim/bin/"
   cp "$FIXTURE/network_service"  "$t/usr/trim/bin/"
   cp "$FIXTURE/resmon_service"   "$t/usr/trim/bin/"
+  cp "$FIXTURE/trim_app_center"  "$t/usr/trim/bin/"
+  cp "$FIXTURE/liveupdate"       "$t/usr/trim/bin/"   # 1010 起 liveupdate.hide-kernel-entry 归入 AOB 层
   cp "$WWW_FIXTURE"/www/assets/Setting-*.js "$t/usr/trim/www/assets/"
   cp "$WWW_FIXTURE"/www/assets/index-*.js "$t/usr/trim/www/assets/"
   cp "$WWW_FIXTURE/share/.restore/www.zip"  "$t/usr/trim/share/.restore/"
@@ -139,6 +144,18 @@ then ok "首轮 apply：$n_active 条全部 applied（计数由补丁集推导�
 $PY "$TC/aobpatch.py" apply --rootfs "$T" --patchset "$PATCHSET" > "$W/r2.json" 2>/dev/null
 n_applied=$($PY -c "import json;print(sum(1 for p in json.load(open('$W/r2.json'))['patches'] if p['status']=='applied'))")
 [ "$n_applied" = "0" ] && ok "重复 apply 全部 already（幂等）" || no "重复 apply 仍有 $n_applied 条 applied"
+$PY - "$W/r1.json" "$W/r2.json" <<'PYEOF' && ok "tpk-perm 新条目：r1 applied、r2 already（幂等重放，真值=补丁集）" || no "tpk-perm 新条目状态异常"
+import json, sys
+mine = {"trim_app_center#tpk-walk-0644->0755", "trim_app_center#downloads-mkdir-0750->0755"}
+def pick(f):
+    d = json.load(open(f))
+    return {p["id"]: p.get("status") for p in d["patches"] if p["id"] in mine}
+s1, s2 = pick(sys.argv[1]), pick(sys.argv[2])
+assert set(s1) == mine, "r1 缺新条目: %s" % s1
+assert all(v == "applied" for v in s1.values()), "r1: %s" % s1
+assert set(s2) == mine, "r2 缺新条目: %s" % s2
+assert all(v == "already" for v in s2.values()), "r2: %s" % s2
+PYEOF
 
 echo "== 2) 自愈网：换回原版 -> 重放恢复（比 file_hashes.patched） =="
 cp "$FIXTURE/libnfile.so" "$T/usr/trim/lib/libnfile.so"
@@ -215,6 +232,168 @@ for p in d["patches"]:
         assert "input_sha256" in p, p["id"]
     else:  # text 补丁：无整文件哈希锚点，用 files[].input_sha256
         assert p.get("files") and all("input_sha256" in f for f in p["files"]), p["id"]
+PYEOF
+
+echo "== 6) tpk-perm 新条目定向：锚点失败即停 + expect-mismatch 失败即停 =="
+# 6a) 锚点方向（真值=补丁集 file_hashes）：篡改 P1 特征 -> 整文件哈希偏离 orig/patched -> 失败即停
+mk_tree "$T"
+if $PY - "$T/usr/trim/bin/trim_app_center" <<'PYEOF'
+import sys
+p = sys.argv[1]
+data = bytearray(open(p, "rb").read())
+i = data.find(bytes.fromhex("b9a4010000e8"))
+assert i >= 0, "P1 特征缺失（fixture 漂移）"
+data[i + 1] ^= 0xFF          # a4 -> 5b：特征失效且整文件哈希偏离 orig/patched
+open(p, "wb").write(data)
+print("  (tampered trim_app_center P1 @%#x)" % i)
+PYEOF
+then :; else no "6a: 找不到可篡改的 P1 特征"; fi
+b="$(snap "$T")"
+if $PY "$TC/aobpatch.py" apply --rootfs "$T" --patchset "$PATCHSET" --report "$W/r6a.json" >/dev/null 2>&1; then
+  no "6a: 被篡改 trim_app_center 仍成功（应失败）"
+else
+  ok "6a: 被篡改 trim_app_center 报错且退出非 0"
+fi
+a="$(snap "$T")"
+[ "$a" = "$b" ] && ok "6a: 失败后未写任何文件（未产出半成品）" || no "6a: 失败后文件被写坏"
+$PY - "$W/r6a.json" <<'PYEOF' && ok "6a: 报告 precheck-failed 且新条目 unknown-file-hash" || no "6a: 报告状态不符"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("phase") == "precheck-failed" and d.get("ok") is False, d.get("phase")
+s = {p["id"]: p.get("status") for p in d["patches"] if p["id"].startswith("trim_app_center#")}
+assert s.get("trim_app_center#tpk-walk-0644->0755") == "unknown-file-hash", s
+assert s.get("trim_app_center#downloads-mkdir-0750->0755") == "unknown-file-hash", s
+PYEOF
+# 6b) expect-mismatch 方向：去锚点迷你补丁集（条目仍取自真值补丁集）+ P1 特征出现 2 次
+mk_tree "$T"
+if $PY - "$PATCHSET" "$W/mini.json" "$T/usr/trim/bin/trim_app_center" <<'PYEOF'
+import json, sys
+ps = json.load(open(sys.argv[1]))
+mini = {"fnos_version": ps.get("fnos_version"),
+        "patches": [p for p in ps["patches"] if p["id"].startswith("trim_app_center#")],
+        "file_hashes": {}}   # 去锚点：让命中计数（而非哈希门）成为失败原因
+assert len(mini["patches"]) == 2, mini["patches"]
+json.dump(mini, open(sys.argv[2], "w"))
+with open(sys.argv[3], "ab") as f:
+    f.write(bytes.fromhex("b9a4010000e8"))   # 追加一份 P1 特征 -> hits=2 != expect 1
+PYEOF
+then :; else no "6b: 迷你补丁集/篡改样本构造失败"; fi
+b="$(snap "$T")"
+if $PY "$TC/aobpatch.py" apply --rootfs "$T" --patchset "$W/mini.json" --report "$W/r6b.json" >/dev/null 2>&1; then
+  no "6b: hits=2 仍成功（应 expect-mismatch）"
+else
+  ok "6b: expect-mismatch 报错且退出非 0"
+fi
+a="$(snap "$T")"
+[ "$a" = "$b" ] && ok "6b: 失败后未写任何文件（未产出半成品）" || no "6b: 失败后文件被写坏"
+$PY - "$W/r6b.json" <<'PYEOF' && ok "6b: 报告新条目 expect-mismatch(2!=1)" || no "6b: 报告状态不符"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d.get("ok") is False
+s = {p["id"]: p.get("status") for p in d["patches"] if p["id"].startswith("trim_app_center#")}
+assert str(s.get("trim_app_center#tpk-walk-0644->0755", "")).startswith("expect-mismatch"), s
+PYEOF
+
+echo "== 7) best-effort 模式（合成小 fixture；断言三档/隔离/回退/备份） =="
+BT="$W/be"; rm -rf "$BT"; mkdir -p "$BT/usr/trim/bin"
+if $PY - "$PATCHSET" "$BT" <<'PYEOF'
+import json, sys, os, hashlib
+ps_path, bt = sys.argv[1], sys.argv[2]
+ps = json.load(open(ps_path))
+b = lambda n: b"\x00" * n
+mk = lambda rel, data: open(os.path.join(bt, rel), "wb").write(data)
+# ready（orig 锚定）、unverified（哈希未知唯一命中）、nomatch、ambiguous、already（patched 锚定）
+a = b(32) + bytes.fromhex("deadbeef") + b(32)          # unverified unique
+mk("usr/trim/bin/a.bin", a)
+mk("usr/trim/bin/b.bin", b"\x11" * 64)                 # nomatch
+mk("usr/trim/bin/c.bin", bytes.fromhex("deadbeef") + b"\x00" * 8 + bytes.fromhex("deadbeef"))  # ambiguous
+d = b(32) + bytes.fromhex("cafebabe") + b(32)          # orig-known ready
+dp = d.replace(bytes.fromhex("cafebabe"), bytes.fromhex("9090babe"))
+mk("usr/trim/bin/d.bin", d)
+e = b(32) + bytes.fromhex("90909090") + b(32)          # patched-known already
+mk("usr/trim/bin/e.bin", e)
+mini = {"fnos_version": ps.get("fnos_version"), "patches": [
+    {"id": "a.unverified", "file": "usr/trim/bin/a.bin", "match": "de ad be ef",
+     "replace": [{"find": "de ad", "to": "90 90"}], "expect": 1},
+    {"id": "b.nomatch", "file": "usr/trim/bin/b.bin", "match": "de ad be ef",
+     "replace": [{"find": "de ad", "to": "90 90"}], "expect": 1},
+    {"id": "c.ambiguous", "file": "usr/trim/bin/c.bin", "match": "de ad be ef",
+     "replace": [{"find": "de ad", "to": "90 90"}], "expect": 1},
+    {"id": "d.ready", "file": "usr/trim/bin/d.bin", "match": "ca fe ba be",
+     "replace": [{"find": "ca fe", "to": "90 90"}], "expect": 1},
+    {"id": "e.already", "file": "usr/trim/bin/e.bin", "match": "ca fe ba be",
+     "replace": [{"find": "ca fe", "to": "90 90"}], "expect": 1},
+], "file_hashes": {
+    "usr/trim/bin/d.bin": {"orig": hashlib.sha256(d).hexdigest(), "patched": hashlib.sha256(dp).hexdigest()},
+    "usr/trim/bin/e.bin": {"orig": "00" * 64, "patched": hashlib.sha256(e).hexdigest()},
+}}
+json.dump(mini, open(os.path.join(bt, "ps.json"), "w"))
+PYEOF
+then :; else no "7: 合成 fixture 构造失败"; fi
+# 7a) check 三档
+$PY "$TC/aobpatch.py" check --rootfs "$BT" --patchset "$BT/ps.json" --best-effort > "$W/be-check.json" 2>/dev/null
+$PY - "$W/be-check.json" <<'PYEOF' && ok "7a: check 三档 ready/ready-unverified/skipped/already 齐全" || no "7a: check 状态不符"
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = {p["id"]: p["status"].split("(")[0] for p in d["patches"]}
+assert d["ok"] is True, d.get("ok")
+assert s == {"a.unverified": "ready-unverified", "b.nomatch": "skipped",
+             "c.ambiguous": "skipped", "d.ready": "ready", "e.already": "already"}, s
+PYEOF
+# 7b) apply：ready/unverified 被应用，skipped 不写，互不阻塞
+$PY "$TC/aobpatch.py" apply --rootfs "$BT" --patchset "$BT/ps.json" --best-effort > "$W/be-apply.json" 2>/dev/null
+$PY - "$W/be-apply.json" "$BT" <<'PYEOF' && ok "7b: apply 后 ready/unverified 已写、skipped 文件未动、ok 仍 true" || no "7b: apply 行为不符"
+import json, sys
+d = json.load(open(sys.argv[1])); bt = sys.argv[2]
+s = {p["id"]: p["status"].split("(")[0] for p in d["patches"]}
+assert d["ok"] is True
+assert s["d.ready"] == "applied" and s["a.unverified"] == "applied", s
+assert s["b.nomatch"] == "skipped" and s["c.ambiguous"] == "skipped", s
+assert open(bt + "/usr/trim/bin/b.bin", "rb").read() == b"\x11" * 64
+assert open(bt + "/usr/trim/bin/c.bin", "rb").read().count(bytes.fromhex("deadbeef")) == 2
+PYEOF
+# 7c) fallback：unknown-hash 唯一命中 -> skipped + force_cmd；强制可应用
+BT2="$W/be2"; rm -rf "$BT2"; mkdir -p "$BT2/usr/trim/bin"
+cp "$BT/usr/trim/bin/a.bin" "$BT2/usr/trim/bin/a.bin" 2>/dev/null || true
+$PY - "$BT/ps.json" "$BT2" <<'PYEOF'
+import json, sys, os, shutil
+ps = json.load(open(sys.argv[1])); bt2 = sys.argv[2]
+a = b"\x00" * 32 + bytes.fromhex("deadbeef") + b"\x00" * 32
+open(os.path.join(bt2, "usr/trim/bin/a.bin"), "wb").write(a)
+mini = {"fnos_version": ps["fnos_version"],
+        "patches": [p for p in ps["patches"] if p["id"] == "a.unverified"],
+        "file_hashes": {}}
+json.dump(mini, open(os.path.join(bt2, "ps.json"), "w"))
+PYEOF
+$PY "$TC/aobpatch.py" apply --rootfs "$BT2" --patchset "$BT2/ps.json" --best-effort --fallback > "$W/be-fb.json" 2>/dev/null
+$PY - "$W/be-fb.json" <<'PYEOF' && ok "7c: fallback 下 unknown-hash 唯一命中被 skipped 且带 force_cmd" || no "7c: fallback 行为不符"
+import json, sys
+d = json.load(open(sys.argv[1]))
+p = d["patches"][0]
+assert p["status"] == "skipped" and p.get("reason") == "unknown-hash-fallback", p
+assert "--force-unverified --patch-id a.unverified" in p.get("force_cmd", ""), p.get("force_cmd")
+PYEOF
+$PY "$TC/aobpatch.py" apply --rootfs "$BT2" --patchset "$BT2/ps.json" --best-effort --fallback --force-unverified --patch-id a.unverified > "$W/be-force.json" 2>/dev/null
+$PY - "$W/be-force.json" "$BT2" <<'PYEOF' && ok "7c: --force-unverified --patch-id 强制应用成功" || no "7c: 强制应用失败"
+import json, sys
+d = json.load(open(sys.argv[1])); bt2 = sys.argv[2]
+p = d["patches"][0]
+assert p["status"] == "applied" and p.get("applied_as") == "ready-unverified", p
+data = open(bt2 + "/usr/trim/bin/a.bin", "rb").read()
+assert data.count(bytes.fromhex("deadbeef")) == 0
+PYEOF
+# 7d) 备份存在且只保留最近 3 次运行目录
+$PY - "$BT" <<'PYEOF' && ok "7d: 写前备份目录存在（backups/<ts>/ 下有文件）" || no "7d: 无备份"
+import os, sys
+bt = sys.argv[1]
+root = os.path.join(bt, "usr/local/share/fnos-toolchain/backups")
+dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))] if os.path.isdir(root) else []
+assert dirs, "no backup dirs"
+files = []
+for d in dirs:
+    for dp, _, fns in os.walk(os.path.join(root, d)):
+        files += fns
+assert files, "backup dirs empty"
 PYEOF
 
 rm -rf "$W"

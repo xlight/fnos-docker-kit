@@ -22,7 +22,7 @@
 #   fnos_patch.py apply  --rootfs <dir> [--patches <json>] [--mount-shim <sh>]
 #   fnos_patch.py status --rootfs <dir>
 # ============================================================================
-import argparse, glob, json, os, shutil, subprocess, sys
+import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys
 
 TOOLCHAIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,8 +51,8 @@ WantedBy=multi-user.target
 AOB_WWW_UNIT = """[Unit]
 Description=fnOS AOB replay (text/www patches) after /usr/trim/www is ready
 DefaultDependencies=no
-After=local-fs.target sysrestore.service trim_main.service
-Wants=sysrestore.service
+After=local-fs.target sysrestore.service trim_main.service fnos-patchset-fetch.service
+Wants=sysrestore.service fnos-patchset-fetch.service
 ConditionPathExists=/usr/local/sbin/fnos-dirfd-shim.py
 
 [Service]
@@ -73,16 +73,19 @@ Description=fnOS disk I/O monitor opt-in (applies disabled resmon disk-io patch)
 DefaultDependencies=no
 After=local-fs.target fnos-dirfd-shim.service
 Before=trim_init.service trim_main.service
-ConditionPathExists=/usr/local/share/fnos-toolchain/aobpatch.py
+ConditionPathExists=/usr/local/sbin/fnos-dirfd-shim.py
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/share/fnos-toolchain/aobpatch.py apply --rootfs / --patchset /usr/local/share/fnos-toolchain/patches/{patchset} --only aob --include-disabled
+# 运行时按版本选择补丁集（wrapper --profile disk-io 内部走精确→最近更早→no-compatible）
+ExecStart=/usr/local/sbin/fnos-dirfd-shim.py apply --profile disk-io
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
 
 MOUNTDIR_UNIT = """[Unit]
 Description=fnOS mount-dir rebind (host dir -> volume subdir)
@@ -121,40 +124,369 @@ TRASH_DROPIN_BODY = (
 # 容器场景不需要对外提供 NFS，故镜像内直接 mask。
 # 代价：fnOS 的「NFS 共享」特性随之不可用。如需恢复：删 rootfs 内
 #       /etc/systemd/system/<unit> 这个指向 /dev/null 的符号链接即可。
-MASK_UNITS = ("nfs-server.service",)
+MASK_UNITS = ("nfs-server.service", "notify_service.service", "trim_trashbind.service")
+
+# ---- zpool shim + pg fix（容器环境适配：消除 syslog 噪音）----
+# 背景（见 fnos/29-zpool-pg-syslog-noise-fix.md）：fnOS 在容器内调用 zpool status
+# 检测 ZFS 池，但容器无 /dev/zfs → 每 ~5 秒报错。shim 拦截 zpool 调用返回空池 JSON。
+# pg fix：PostgreSQL 15 WAL 归档服务需要 /var/backups/postgresql 目录 + pg_hba.conf replication 条目。
+ZPOOL_SHIM = r"""#!/bin/sh
+# zpool shim for fnOS in LXC container
+for arg in "$@"; do
+  case "$arg" in
+    --version|version)
+      echo "zfs-2.4.1-1"
+      echo "zfs-kmod-2.4.4-pve1"
+      exit 0
+      ;;
+  esac
+done
+subcmd=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) continue ;;
+    *) subcmd="$arg"; break ;;
+  esac
+done
+case "$subcmd" in
+  status|list)
+    printf '{"output_version":{"command":"zpool %s","vers_major":0,"vers_minor":1},"pools":{},"error_count":0}\n' "$subcmd"
+    exit 0
+    ;;
+esac
+exit 0
+"""
+
+ZPOOL_SHIM_SCRIPT = r"""#!/bin/sh
+# fnOS container zpool shim + pg fix (container-side, baked into rootfs)
+# Called by fnos-zpool-shim.service on boot, and by fnos-syslog-fix.sh on host.
+ZPOOL_SHIM_MARKER="zpool shim for fnOS in LXC container"
+ZPOOL_REAL="/sbin/zpool.real"
+ZPOOL_SHIM="/sbin/zpool"
+
+apply_zpool_shim() {
+    if grep -q "$ZPOOL_SHIM_MARKER" "$ZPOOL_SHIM" 2>/dev/null; then
+        return 0
+    fi
+    if [ -f "$ZPOOL_SHIM" ]; then
+        mv -f "$ZPOOL_SHIM" "$ZPOOL_REAL"
+    fi
+    cat > "$ZPOOL_SHIM" << 'SHIMEOF'
+#!/bin/sh
+# zpool shim for fnOS in LXC container
+for arg in "$@"; do
+  case "$arg" in
+    --version|version)
+      echo "zfs-2.4.1-1"
+      echo "zfs-kmod-2.4.4-pve1"
+      exit 0
+      ;;
+  esac
+done
+subcmd=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) continue ;;
+    *) subcmd="$arg"; break ;;
+  esac
+done
+case "$subcmd" in
+  status|list)
+    printf '{"output_version":{"command":"zpool %s","vers_major":0,"vers_minor":1},"pools":{},"error_count":0}\n' "$subcmd"
+    exit 0
+    ;;
+esac
+exit 0
+SHIMEOF
+    chmod 755 "$ZPOOL_SHIM"
+}
+
+apply_pg_fix() {
+    mkdir -p /var/backups/postgresql
+    if id postgres >/dev/null 2>&1; then
+        chown postgres:postgres /var/backups/postgresql
+    fi
+    chmod 750 /var/backups/postgresql
+    PG_VER=$(ls /etc/postgresql/ 2>/dev/null | head -1)
+    if [ -n "$PG_VER" ]; then
+        PG_HBA="/etc/postgresql/$PG_VER/main/pg_hba.conf"
+        if [ -f "$PG_HBA" ] && ! grep -qE '^local[[:space:]]+replication[[:space:]]+postgres' "$PG_HBA"; then
+            sed -i '/^local[[:space:]]\+all[[:space:]]\+postgres/a local   replication     postgres                                    peer map=trim_root' "$PG_HBA"
+        fi
+    fi
+    if [ -n "$PG_VER" ] && pgrep -x postgres >/dev/null 2>&1; then
+        pg_ctlcluster "$PG_VER" main reload 2>/dev/null || true
+    fi
+}
+
+rollback_zpool_shim() {
+    if [ -f "$ZPOOL_REAL" ]; then
+        rm -f "$ZPOOL_SHIM"
+        mv "$ZPOOL_REAL" "$ZPOOL_SHIM"
+    fi
+}
+
+rollback_pg_fix() {
+    PG_VER=$(ls /etc/postgresql/ 2>/dev/null | head -1)
+    if [ -n "$PG_VER" ]; then
+        PG_HBA="/etc/postgresql/$PG_VER/main/pg_hba.conf"
+        if [ -f "$PG_HBA" ]; then
+            sed -i '/^local   replication     postgres/d' "$PG_HBA"
+        fi
+    fi
+    rm -rf /var/backups/postgresql
+}
+
+status_zpool_shim() {
+    if grep -q "$ZPOOL_SHIM_MARKER" "$ZPOOL_SHIM" 2>/dev/null; then
+        printf '  zpool-shim          : GREEN (shim installed)\n'
+        return 0
+    else
+        printf '  zpool-shim          : RED   (shim not installed)\n'
+        return 1
+    fi
+}
+
+status_pg_fix() {
+    local fail=0
+    if [ -d /var/backups/postgresql ]; then
+        printf '  pg-fix:dir          : GREEN (/var/backups/postgresql)\n'
+    else
+        printf '  pg-fix:dir          : RED   (missing /var/backups/postgresql)\n'
+        fail=1
+    fi
+    PG_VER=$(ls /etc/postgresql/ 2>/dev/null | head -1)
+    if [ -n "$PG_VER" ] && [ -f "/etc/postgresql/$PG_VER/main/pg_hba.conf" ] && grep -qE '^local[[:space:]]+replication[[:space:]]+postgres' "/etc/postgresql/$PG_VER/main/pg_hba.conf" 2>/dev/null; then
+        printf '  pg-fix:pg_hba       : GREEN (replication entry present)\n'
+    else
+        printf '  pg-fix:pg_hba       : RED   (replication entry missing)\n'
+        fail=1
+    fi
+    return $fail
+}
+
+case "${1:-}" in
+    apply)
+        apply_zpool_shim
+        apply_pg_fix
+        ;;
+    rollback)
+        rollback_pg_fix
+        rollback_zpool_shim
+        ;;
+    status)
+        rc=0
+        status_zpool_shim || rc=1
+        status_pg_fix || rc=1
+        exit $rc
+        ;;
+    *)
+        echo "Usage: $0 {apply|rollback|status}"
+        exit 2
+        ;;
+esac
+"""
+
+ZPOOL_SHIM_UNIT = """[Unit]
+Description=fnOS zpool shim + pg fix (container environment)
+DefaultDependencies=no
+After=local-fs.target postgresql@*.service
+Before=trim_main.service
+ConditionPathExists=/usr/local/sbin/fnos-zpool-shim.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/fnos-zpool-shim.sh apply
+
+[Install]
+WantedBy=sysinit.target
+"""
 
 DIRFD_SHIM = """#!/usr/bin/env python3
 # 开机幂等重放 AOB 补丁（自愈网：应对 fnOS 自更新把二进制换回原版）。
+# 按运行版本**只选一个补丁集**：精确匹配 → 数值最近的严格更早版本（fallback）→ no-compatible。
+# 子命令：
+#   apply [--only aob|text|all] [--include-disabled] [--best-effort ...]  透传 aobpatch
+#   apply --profile disk-io        等价于 apply --only aob --include-disabled（磁盘 I/O opt-in）
+#   status                         选择模式 + aobpatch check 摘要（--best-effort）
+#   revert                         按文件从 backups/<最新 ts>/ 恢复
 # 两相调用：
 #   apply --only aob   → 仅二进制补丁，由 fnos-dirfd-shim.service 在 trim 之前跑；
 #   apply --only text  → 仅文本/www 补丁，由 fnos-aob-www.service 在 /usr/trim/www
 #                        就绪后跑（sysrestore 异步解压，故这里轮询等待、有界）。
-#   apply --only aob --include-disabled → 连 disabled:true 的 opt-in 补丁一起打，
-#                        由 fnos-disk-io-monitor.service 跑（默认不 enable）。
-# 参数原样透传给 aobpatch.py。不带 --only 时全量处理（手动排查用）。
-import sys, glob, subprocess, time
+import sys, os, glob, json, re, shutil, subprocess, time
 D = "/usr/local/share/fnos-toolchain"
-args = sys.argv[1:] or ["apply"]
-only = args[args.index("--only") + 1] if "--only" in args else "all"
-ps_list = sorted(glob.glob(D + "/patches/*.json"))
+VER_PATH = "/usr/trim/etc/version"
+PATCHES = D + "/patches"
+BACKUPS = D + "/backups"
 
-def once():
-    rc = 0
-    for ps in ps_list:
-        r = subprocess.run([sys.executable, D + "/aobpatch.py", *args,
-                            "--rootfs", "/", "--patchset", ps])
-        rc = rc or r.returncode
+
+def vtuple(v):
+    # 只取前导 dotted 数字部分；预发布后缀（如 -rc1）整体按 no-compatible 处理
+    m = re.match(r"\\s*(\\d+(?:\\.\\d+)*)", str(v))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def running_version():
+    try:
+        return open(VER_PATH).read().strip().lstrip("Vv")
+    except OSError:
+        return ""
+
+
+def select():
+    # 返回 (mode, patchset_path, running_ver)：exact / fallback / no-compatible
+    # 带后缀的预发布版本（如 1.2.1010-rc1）除精确字符串匹配外一律 no-compatible
+    rv = running_version()
+    clean = bool(re.match(r"\\s*\\d+(?:\\.\\d+)*\\s*$", rv))
+    best = None
+    for f in sorted(glob.glob(PATCHES + "/fnos-*.json")):
+        try:
+            v = str(json.load(open(f)).get("fnos_version", "")).lstrip("Vv")
+        except Exception:
+            continue
+        if rv and v == rv:
+            return "exact", f, rv
+        if rv and clean and vtuple(v) < vtuple(rv):
+            if best is None or vtuple(v) > vtuple(best[0]):
+                best = (v, f)
+    if best:
+        return "fallback", best[1], rv
+    return "no-compatible", None, rv
+
+
+def mask_noisy_units():
+    # 开机时补齐 LXC 里必然失败的服务的 mask（与 fnos_patch.py MASK_UNITS 一致）。
+    # 背景：notify_service（二进制缺失）、trim_trashbind（依赖内核设备 /dev/trim-trashbin）
+    # 在 LXC 里每 5s 崩一次，restart counter 能到 100+；老容器/被 fnOS 还原过的容器会
+    # 丢掉镜像烘焙的 mask → 循环重启。开机重放时幂等补上，杜绝复发。
+    for u in ("nfs-server.service", "notify_service.service", "trim_trashbind.service"):
+        p = "/etc/systemd/system/" + u
+        try:
+            if os.path.islink(p) and os.readlink(p) == "/dev/null":
+                continue
+            subprocess.run(["systemctl", "stop", u], timeout=30,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["systemctl", "disable", u], timeout=30,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.lexists(p):
+                os.unlink(p)
+            os.symlink("/dev/null", p)
+            print("masked %s (LXC 中不可用，避免重启循环)" % u)
+        except Exception as e:
+            print("mask %s failed: %s" % (u, e))
+    subprocess.run(["systemctl", "daemon-reload"], timeout=60,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def aob(*args):
+    mode, ps, rv = select()
+    if ps is None:
+        print("no-compatible-patchset (running=%s): 无可用补丁集，跳过本次重放" % rv)
+        return 0
+    restart = "--restart-consumers" in args
+    args = [a for a in args if a != "--restart-consumers"]
+    cmd = [sys.executable, D + "/aobpatch.py", *args, "--rootfs", "/", "--patchset", ps]
+    if mode == "fallback":
+        cmd += ["--fallback"]
+    if "--best-effort" not in args:
+        cmd += ["--best-effort"]
+    print("replay mode=%s running=%s patchset=%s" % (mode, rv, os.path.basename(ps)))
+    rc = subprocess.run(cmd).returncode
+    if restart and rc == 0:
+        restart_consumers()
     return rc
 
+
+def restart_consumers():
+    # live 替换 libnfile/libnperm/libtrimacl 后重启所有消费者（doc 35/36 的教训）
+    lst = D + "/lib-consumers.txt"
+    if not os.path.exists(lst):
+        print("no consumer list (%s); skip restart" % lst)
+        return
+    for u in open(lst):
+        u = u.strip()
+        if not u or u.startswith("#"):
+            continue
+        try:
+            r = subprocess.run(["systemctl", "restart", u], timeout=90)
+            print("restart %s: rc=%d" % (u, r.returncode))
+        except Exception as e:
+            print("restart %s failed: %s" % (u, e))
+
+
+def status():
+    mode, ps, rv = select()
+    print("running=%s mode=%s patchset=%s" % (rv, mode, os.path.basename(ps) if ps else "-"))
+    if not ps:
+        return 0
+    r = subprocess.run([sys.executable, D + "/aobpatch.py", "check", "--rootfs", "/",
+                        "--patchset", ps, "--best-effort"]
+                       + (["--fallback"] if mode == "fallback" else []),
+                       capture_output=True, text=True)
+    try:
+        d = json.loads(r.stdout)
+        from collections import Counter
+        c = Counter(str(p.get("status", "?")).split("(")[0] for p in d.get("patches", []))
+        print("ok=%s patches=%s" % (d.get("ok"), dict(c)))
+        for w in d.get("warnings", [])[:20]:
+            print("  WARN", w)
+    except Exception:
+        print(r.stdout[-500:], r.stderr[-300:])
+    return 0 if r.returncode == 0 else 1
+
+
+def revert():
+    if not os.path.isdir(BACKUPS):
+        print("no backups dir"); return 1
+    ts = sorted(os.listdir(BACKUPS))[-1]
+    root = os.path.join(BACKUPS, ts)
+    n = 0
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            src = os.path.join(dp, fn)
+            dst = os.path.join("/", os.path.relpath(src, root))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+    print("reverted %d file(s) from backups/%s" % (n, ts))
+    return 0
+
+
+args = sys.argv[1:]
+if args and args[0] == "status":
+    sys.exit(status())
+if args and args[0] == "revert":
+    sys.exit(revert())
+# 每次 apply（含开机重放）先补齐冗余服务 mask —— fnOS 升级/还原可能把 mask 弄丢
+mask_noisy_units()
+if "--profile" in args:
+    i = args.index("--profile")
+    prof = args[i + 1] if i + 1 < len(args) else ""
+    rest = args[:i] + args[i + 2:]
+    if prof == "disk-io":
+        args = ["apply", "--only", "aob", "--include-disabled"] + [a for a in rest if a != "apply"]
+    else:
+        args = rest or ["apply"]
+if not args:
+    args = ["apply"]
+only = args[args.index("--only") + 1] if "--only" in args else "all"
 if only == "text":
-    rc = 1
-    for _ in range(30):          # www 最晚由 sysrestore 解压，等待至多 ~60s
-        rc = once()
+    # www 由 sysrestore 异步解压：先等 check 通过（文件就绪），再**只应用一次**
+    # （反复 apply 会每次生成一个备份目录，把真正的备份冲掉）
+    ready = False
+    for _ in range(30):
+        rc = aob("check", "--only", "text")
         if rc == 0:
+            ready = True
             break
         time.sleep(2)
-    sys.exit(rc)
-sys.exit(once())
+    if not ready:
+        print("www not ready yet; skip text replay this round")
+        sys.exit(0)
+    sys.exit(aob("apply", "--only", "text"))
+sys.exit(aob(*args))
 """
 
 # ---- 网卡 NM 管理（L2）：让 NetworkManager 拥有 eth0 ----
@@ -208,11 +540,114 @@ WantedBy=sysinit.target
 """
 
 
+PATCH_STATUS_UNIT = """[Unit]
+Description=fnOS patch status detector (on-boot check + WebUI notification)
+After=fnos-dirfd-shim.service fnos-aob-www.service fnos-patchset-fetch.service postgresql.service
+Wants=fnos-patchset-fetch.service postgresql.service
+
+[Service]
+Type=oneshot
+# 去掉 RemainAfterExit：让 fnos-patch-status.timer 能重复触发
+ExecStart=/usr/local/sbin/fnos-patch-status --notify --log
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+PATCH_STATUS_TIMER = """[Unit]
+Description=Periodic fnOS patch status refresh
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
+"""
+
+# 目标版本补丁集下载器（网络就绪后；失败返回 0 不阻塞开机）
+PATCHSET_FETCH_UNIT = """[Unit]
+Description=fnOS patchset fetch (download missing target-version patchset)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=/usr/local/sbin/fnos-patchset-fetch
+ExecStartPost=/bin/true
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# nginx 同源路由单元：在 trim_nginx 启动前创建 live conf 并同步 ng.conf.zip
+NGINX_ROUTE_UNIT = """[Unit]
+Description=fnOS nginx same-origin verlan route (before trim_nginx)
+DefaultDependencies=no
+After=local-fs.target trim_init.service
+Before=trim_nginx.service
+ConditionPathExists=/usr/local/sbin/fnos-nginx-route.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/fnos-nginx-route.sh
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def write_file(path, content, mode=0o644):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
     os.chmod(path, mode)
+
+
+def upsert_kv(path, key, value, comment=None):
+    """键值文件里改一个键、其余不动（shell source 风格，如 /etc/default/*）。
+
+    有该键则替换行，无则追加 `KEY=value`（附 comment 行时一并追加）；
+    文件不存在则新建。重跑幂等。返回是否发生改动。
+    """
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = None
+    if lines is None:
+        lines = []
+        if comment:
+            lines.append(comment)
+        lines.append("%s=%s" % (key, value))
+        changed = True
+    else:
+        changed = False
+        pat = re.compile(r"^%s\s*=" % re.escape(key))
+        for i, l in enumerate(lines):
+            if pat.match(l):
+                want = "%s=%s" % (key, value)
+                if l != want:
+                    lines[i] = want
+                    changed = True
+                break
+        else:
+            if comment:
+                lines.append(comment)
+            lines.append("%s=%s" % (key, value))
+            changed = True
+    if changed:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    return changed
 
 
 def enable_unit(rootfs, name, target="multi-user.target"):
@@ -287,7 +722,7 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
     write_file(os.path.join(rootfs, "etc/systemd/system/fnos-mountdir.service"), MOUNTDIR_UNIT)
     # 磁盘 I/O 刷新：opt-in 单元只烘焙、**不 enable**（补丁默认不生效；需显式 systemctl enable）。
     write_file(os.path.join(rootfs, "etc/systemd/system/fnos-disk-io-monitor.service"),
-               DISKIO_UNIT.format(patchset=os.path.basename(patches)))
+               DISKIO_UNIT)  # 运行时按版本选择补丁集，不再烘焙文件名
     write_file(os.path.join(rootfs, "usr/local/sbin/fnos-nic-fuse.sh"), NIC_FUSE_SH, 0o755)
     write_file(os.path.join(rootfs, "etc/systemd/system/fnos-nic-fuse.service"), NIC_FUSE_UNIT)
     # 回收站 wrapper：资产 .so -> rootfs/usr/local/lib；drop-in 挂到 trim_main（LD_PRELOAD）
@@ -298,15 +733,134 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
     shutil.copy2(TRASH_ASSET, so_dst); os.chmod(so_dst, 0o755)
     write_file(os.path.join(rootfs, TRASH_DROPIN), TRASH_DROPIN_BODY)
     log.append("trash wrapper baked: %s + %s" % (TRASH_SO, TRASH_DROPIN))
+    # ---- zpool shim + pg fix（容器环境适配：消除 syslog 噪音）----
+    # 背景（见 fnos/29-zpool-pg-syslog-noise-fix.md）：fnOS 在容器内调用 zpool status
+    # 检测 ZFS 池，但容器无 /dev/zfs → 每 ~5 秒报错；pg_receivewal 因目录缺失 +
+    # pg_hba.conf 无 replication 条目 → 每 ~2-3 分钟失败重启。
+    zpool_path = os.path.join(rootfs, "sbin", "zpool")
+    zpool_real = os.path.join(rootfs, "sbin", "zpool.real")
+    if os.path.exists(zpool_path) and not os.path.exists(zpool_real):
+        # 检查是否已经是 shim（避免重复重命名）
+        try:
+            content = open(zpool_path).read()
+            if "zpool shim for fnOS in LXC container" not in content:
+                os.rename(zpool_path, zpool_real)
+                log.append("renamed /sbin/zpool -> /sbin/zpool.real")
+        except (OSError, IOError):
+            os.rename(zpool_path, zpool_real)
+            log.append("renamed /sbin/zpool -> /sbin/zpool.real")
+    write_file(zpool_path, ZPOOL_SHIM, 0o755)
+    log.append("zpool shim -> %s" % zpool_path)
+    # 容器侧自愈脚本
+    shim_script_dst = os.path.join(rootfs, "usr/local/sbin/fnos-zpool-shim.sh")
+    os.makedirs(os.path.dirname(shim_script_dst), exist_ok=True)
+    write_file(shim_script_dst, ZPOOL_SHIM_SCRIPT, 0o755)
+    log.append("zpool shim script -> %s" % shim_script_dst)
+    # pg fix：创建 /var/backups/postgresql（构建期 root:root 750，运行期 chown）
+    pg_backup_dir = os.path.join(rootfs, "var", "backups", "postgresql")
+    os.makedirs(pg_backup_dir, exist_ok=True)
+    os.chmod(pg_backup_dir, 0o750)
+    log.append("pg backup dir created: %s (root:root 750, runtime chown)" % pg_backup_dir)
+    # pg_hba.conf 幂等添加 replication 条目（版本动态检测）
+    pg_dir = os.path.join(rootfs, "etc", "postgresql")
+    pg_hba = None
+    if os.path.isdir(pg_dir):
+        for ver in sorted(os.listdir(pg_dir), reverse=True):
+            cand = os.path.join(pg_dir, ver, "main", "pg_hba.conf")
+            if os.path.exists(cand):
+                pg_hba = cand
+                break
+    if pg_hba:
+        try:
+            content = open(pg_hba).read()
+            if "local replication postgres" not in content:
+                lines = content.splitlines()
+                new_lines = []
+                inserted = False
+                for line in lines:
+                    new_lines.append(line)
+                    if not inserted and line.strip().startswith("local") and "postgres" in line and "peer" in line:
+                        new_lines.append("local   replication     postgres                                    peer map=trim_root")
+                        inserted = True
+                if inserted:
+                    with open(pg_hba, "w") as f:
+                        f.write("\n".join(new_lines) + "\n")
+                    log.append("pg_hba.conf replication entry added: %s" % pg_hba)
+                else:
+                    log.append("pg_hba.conf: no matching postgres local line, skipping")
+            else:
+                log.append("pg_hba.conf replication entry already present")
+        except (OSError, IOError) as e:
+            log.append("pg_hba.conf edit failed: %s" % e)
+    else:
+        log.append("pg_hba.conf not found (PostgreSQL not installed in rootfs?)")
+    # 自愈 unit
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-zpool-shim.service"), ZPOOL_SHIM_UNIT)
+    log.append("zpool shim unit baked: etc/systemd/system/fnos-zpool-shim.service")
+    enable_unit(rootfs, "fnos-zpool-shim.service", "sysinit.target")
+    log.append("zpool shim unit enabled (sysinit.target)")
     enable_unit(rootfs, "fnos-dirfd-shim.service")
     enable_unit(rootfs, "fnos-aob-www.service")
     enable_unit(rootfs, "fnos-mountdir.service")
     enable_unit(rootfs, "fnos-nic-fuse.service", "sysinit.target")
+    # ---- fnos-patch-status: on-boot unified patch status detector + WebUI notify ----
+    # Copies the container-side detector script and systemd oneshot service so every
+    # built image reports patch health to the WebUI on boot (see fnos-patch-status change).
+    patch_status_src = os.path.join(TOOLCHAIN_DIR, "fnos-patch-status")
+    if os.path.exists(patch_status_src):
+        ps_dst = os.path.join(rootfs, "usr/local/sbin/fnos-patch-status")
+        os.makedirs(os.path.dirname(ps_dst), exist_ok=True)
+        shutil.copy2(patch_status_src, ps_dst)
+        os.chmod(ps_dst, 0o755)
+        log.append("fnos-patch-status detector -> %s" % ps_dst)
+    else:
+        log.append("fnos-patch-status detector source not found in toolchain, skipping")
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patch-status.service"),
+               PATCH_STATUS_UNIT)
+    enable_unit(rootfs, "fnos-patch-status.service")
+    # 定时刷新 + 目标版本补丁集下载 + nginx 同源路由单元
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patch-status.timer"),
+               PATCH_STATUS_TIMER)
+    enable_unit(rootfs, "fnos-patch-status.timer", "timers.target")
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-patchset-fetch"),
+                 os.path.join(rootfs, "usr/local/sbin/fnos-patchset-fetch"))
+    os.chmod(os.path.join(rootfs, "usr/local/sbin/fnos-patchset-fetch"), 0o755)
+    # lib 消费者清单：live 替换 libnfile/libnperm/libtrimacl 后需重启这些服务（doc 35/36）
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers"),
+                 os.path.join(rootfs, "usr/local/share/fnos-toolchain/lib-consumers.txt"))
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patchset-fetch.service"),
+               PATCHSET_FETCH_UNIT)
+    enable_unit(rootfs, "fnos-patchset-fetch.service")
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-nginx-route.sh"),
+                 os.path.join(rootfs, "usr/local/sbin/fnos-nginx-route.sh"))
+    os.chmod(os.path.join(rootfs, "usr/local/sbin/fnos-nginx-route.sh"), 0o755)
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-nginx-route.service"),
+               NGINX_ROUTE_UNIT)
+    enable_unit(rootfs, "fnos-nginx-route.service")
+    log.append("patch-status timer + patchset-fetch + nginx-route baked + enabled")
+    log.append("fnos-patch-status.service baked + enabled")
+    # 启动不等 ifupdown：容器内 interfaces 仅 lo（NIC fuse 每开机洗掉 eth0 stanza，
+    # eth0 归 NM、IP 由宿主 veth 在 ifupdown 之外配好），ifup 等法永不成功，
+    # 缺省 300 秒超时直接拖住 network-online -> trim_init 整条链。upsert 只动一键。
+    upsert_kv(os.path.join(rootfs, "etc/default/networking"), "WAIT_ONLINE_METHOD", "none",
+              "# LXC: ifupdown 只管 lo，不等它（fnos-lxc-boot-tune，否则罚站 300s）")
+    log.append("wait-online none baked: etc/default/networking")
+    # SSH 端口不得预占：清理 ssh.socket 启用软链（systemctl enable ssh.socket 的落盘点，
+    # 未来 Debian 默认 socket 化的 ISO 也会落这里）。fnOS WebUI 开 SSH 前跑 IsPortInUse
+    # 预检，socket activation 预占 22 会让开关"显示关却开不了"（fnos/23-ssh-webui-
+    # toggle-socket-conflict.md）。仅清启用面，不动 /lib 单元本体（保留手动 enable 路径）。
+    sock_wants = os.path.join(rootfs, "etc/systemd/system/sockets.target.wants/ssh.socket")
+    if os.path.lexists(sock_wants):
+        os.remove(sock_wants)
+        log.append("ssh.socket enable symlink removed: etc/systemd/system/sockets.target.wants/ssh.socket")
+    else:
+        log.append("ssh.socket not enabled (absent)")
     # 注意：fnos-disk-io-monitor.service **刻意不 enable**（磁盘 I/O 补丁默认不生效）。
-    # 屏蔽 nfs-server：nfsd 是宿主内核全局态，容器内多实例互踩会 wedge 宿主（见 MASK_UNITS 注释）。
+    # 屏蔽服务：nfs-server（宿主全局 nfsd 互踩）、notify_service（二进制缺失/fsck 孤儿）、
+    # trim_trashbind（依赖内核设备 /dev/trim-trashbin，LXC 中不存在；回收站由 LD_PRELOAD wrapper 替代）。
     for u in MASK_UNITS:
         mask_unit(rootfs, u)
-    log.append("masked units: %s（宿主全局 nfsd 防互踩；fnOS NFS 共享特性随之不可用，"
+    log.append("masked units: %s（宿主全局 nfsd 防互踩 + LXC 冗余服务；"
                "删 /etc/systemd/system/<unit> 符号链接可恢复）" % ", ".join(MASK_UNITS))
     log.append("container-side units baked + enabled（含 NIC NM fuse + AOB 文本相；"
                "disk-io opt-in 单元仅烘焙、未 enable）")
@@ -334,15 +888,45 @@ def _active_fstab_lines(rootfs):
     return active
 
 
+def _trim_app_center_patched(rootfs):
+    """tpk 安装权限修复（appcenter-tpk-perm D5）：trim_app_center 是否处于 patched 态。
+
+    以 rootfs 内烘焙补丁集的 file_hashes 为锚（整文件 sha256 ∈ patched 集为 True，
+    orig/未知为 False）——版本绑定留在 JSON，本文件保持版本无关。
+    旧镜像补丁集无该条目 → False（重跑 stage_patch 刷入新补丁集后即修复）。"""
+    binp = os.path.join(rootfs, "usr/trim/bin/trim_app_center")
+    if not os.path.exists(binp):
+        return False
+    try:
+        sha = hashlib.sha256(open(binp, "rb").read()).hexdigest()
+    except OSError:
+        return False
+    for j in sorted(glob.glob(os.path.join(rootfs, "usr/local/share/fnos-toolchain/patches/*.json"))):
+        try:
+            ps = json.load(open(j))
+        except (OSError, ValueError):
+            continue
+        h = (ps.get("file_hashes") or {}).get("usr/trim/bin/trim_app_center")
+        if not h:
+            continue
+        vals = h.get("patched")
+        vals = [vals] if isinstance(vals, str) else list(vals or [])
+        if sha in vals:
+            return True
+    return False
+
+
 def status(rootfs):
     active = _active_fstab_lines(rootfs)
     st = {
         "fstab(no active trimafs/efi/uuid-root)": active is not None and not any(
             ("trimafs" in l) or ("/boot/efi" in l) or l.split()[1:2] == ["/"] for l in active),
         "mount shim": os.path.exists(os.path.join(rootfs, "usr/local/sbin/mount")),
-        "dirfd shim": os.path.exists(os.path.join(rootfs, "usr/local/sbin/fnos-dirfd-shim.py")),
+        "AOB replay wrapper": os.path.exists(os.path.join(rootfs, "usr/local/sbin/fnos-dirfd-shim.py")),
         "patch set baked": bool(glob.glob(os.path.join(rootfs, "usr/local/share/fnos-toolchain/patches/*.json"))),
         "patch engine baked": os.path.exists(os.path.join(rootfs, "usr/local/share/fnos-toolchain/aobpatch.py")),
+        # tpk 安装权限（appcenter-tpk-perm D5）：旧镜像/未打 → False，重跑 stage_patch 或热修后为 True。
+        "trim_app_center patched": _trim_app_center_patched(rootfs),
         "dirfd unit enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-dirfd-shim.service")),
         "aob-www unit enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-aob-www.service")),
         "mountdir unit enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-mountdir.service")),
@@ -354,7 +938,50 @@ def status(rootfs):
         # 注意：status 的契约是"全 true = 健康"（stage_patch 用 all(values()) 判幂等），
         # 故这里表达"默认未启用"这个**健康态**，而不是"是否启用"（后者健康时为 False 会误判失败）。
         "disk-io opt-in disabled by default": not os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-disk-io-monitor.service")),
+        "wait-online none": _has(rootfs, "etc/default/networking", "WAIT_ONLINE_METHOD=none"),
+        # 健康态表达"未启用"（同上 disk-io 注释）：软链存在=端口将被预占=WebUI SSH 开关失效。
+        "ssh.socket not enabled": not os.path.lexists(os.path.join(rootfs, "etc/systemd/system/sockets.target.wants/ssh.socket")),
+        "patch status service enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-patch-status.service")),
+        "patch status timer enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/timers.target.wants/fnos-patch-status.timer")),
+        "patchset fetch service enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-patchset-fetch.service")),
+        "nginx route unit enabled": os.path.lexists(os.path.join(rootfs, "etc/systemd/system/multi-user.target.wants/fnos-nginx-route.service")),
     }
+    # zpool shim + pg fix（容器环境适配，消除 syslog 噪音）
+    # 注意：status 契约是"全 true = 健康"（stage_patch 用 all(values()) 判幂等），
+    # 故对 rootfs 中**不存在**的组件（如测试 fixture、未装 PostgreSQL 的镜像）
+    # 视为"不适用"（True），避免把"组件未安装"误判为"不健康"。
+    zpool_path = os.path.join(rootfs, "sbin", "zpool")
+    if os.path.exists(zpool_path):
+        try:
+            zpool_content = open(zpool_path).read()
+            st["zpool shim"] = "zpool shim for fnOS in LXC container" in zpool_content
+        except (OSError, IOError):
+            st["zpool shim"] = False
+    else:
+        st["zpool shim"] = True  # 组件不存在 → 不适用
+    pg_dir = os.path.join(rootfs, "etc", "postgresql")
+    if os.path.isdir(pg_dir):
+        st["pg backup dir"] = os.path.exists(os.path.join(rootfs, "var", "backups", "postgresql"))
+        pg_hba_found = False
+        for v in os.listdir(pg_dir):
+            cand = os.path.join(pg_dir, v, "main", "pg_hba.conf")
+            if os.path.exists(cand):
+                try:
+                    for line in open(cand):
+                        if "replication" in line and "postgres" in line and line.strip().startswith("local"):
+                            pg_hba_found = True
+                            break
+                except (OSError, IOError):
+                    pass
+        st["pg hba replication entry"] = pg_hba_found
+    else:
+        st["pg backup dir"] = True  # PostgreSQL 未安装 → 不适用
+        st["pg hba replication entry"] = True  # PostgreSQL 未安装 → 不适用
+    zpool_unit = os.path.join(rootfs, "etc/systemd/system/fnos-zpool-shim.service")
+    if os.path.exists(zpool_unit):
+        st["zpool shim unit enabled"] = os.path.lexists(os.path.join(rootfs, "etc/systemd/system/sysinit.target.wants/fnos-zpool-shim.service"))
+    else:
+        st["zpool shim unit enabled"] = True  # unit 未烘焙 → 不适用
     # nfs-server 屏蔽（宿主全局 nfsd 防互踩）
     for u in MASK_UNITS:
         st["masked: %s" % u] = _is_masked(rootfs, u)
