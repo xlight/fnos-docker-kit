@@ -54,11 +54,13 @@ fh = ps.get("file_hashes") or {}
 bad = []
 for f, h in fh.items():
     b = os.path.basename(f); p = os.path.join(fx, b)
+    want = h.get("orig")
+    want_set = set(want) if isinstance(want, (list, tuple)) else {want}   # orig 可为多 build 哈希列表
     if not os.path.exists(p):
-        bad.append((b, h["orig"], "<missing>")); continue
+        bad.append((b, sorted(want_set), "<missing>")); continue
     got = hashlib.sha256(open(p, "rb").read()).hexdigest()
-    if got != h["orig"]:
-        bad.append((b, h["orig"], got))
+    if got not in want_set:
+        bad.append((b, sorted(want_set), got))
     if f.startswith("usr/trim/bin/") and not (os.stat(p).st_mode & stat.S_IXUSR):
         bad.append((b, "mode=755(可执行)", "mode=%o(不可执行)" % (stat.S_IMODE(os.stat(p).st_mode))))
 if bad:
