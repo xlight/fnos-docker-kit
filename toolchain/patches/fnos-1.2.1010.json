@@ -6,8 +6,8 @@
     "total": 37,
     "aob_ready": 34,
     "aob_total": 34,
-    "validated_at": "2026-11-07T10:06:48Z",
-    "validated_against": "fnOS 1.2.1010 binaries (CT201 sha256 set) + CT201 /usr/trim/www assets; aobpatch check 36/36 ready on pristine, all already after apply"
+    "validated_at": "2026-11-09T05:00:14Z",
+    "validated_against": "fnOS 1.2.1010 binaries: ISO-1010 liveupdate (6c04753f) + OTA-1010 liveupdate (d80a055c) 两变体，统一掩码 match 覆盖两者；aobpatch check 37/37 ready on CT201 (OTA 1010)，apply 后 liveupdate=997d2bcf，其余 36 条 already"
   },
   "patches": [
     {
@@ -800,11 +800,11 @@
       "id": "liveupdate.hide-kernel-entry",
       "kind": "aob",
       "file": "usr/trim/bin/liveupdate",
-      "match": "80 bd 88 db ff ff 00 0f 85 f8 07 00 00",
+      "match": "ff 50 10 84 c0 0f 85 ?? ?? 00 00 80 bd ?? db ff ff 00 0f 85 ?? ?? ?? ??",
       "replace": [
         {
-          "find": "0f 85 f8 07 00 00",
-          "to": "90 90 90 90 90 90"
+          "find": "80 bd ?? db ff ff 00 0f 85 ?? ?? ?? ??",
+          "to": "80 bd ?? db ff ff 00 90 90 90 90 90 90"
         }
       ],
       "expect": 1
@@ -853,8 +853,14 @@
       "patched": "ea3b8e7bba73e9bed50a201569f996f5baa97cb1230821f137345be8b127bf0b"
     },
     "usr/trim/bin/liveupdate": {
-      "orig": "6c04753fd3d98b78b6711c406a9d31fce9376d5eb6a1b5d61106e5ea9fa19bf7",
-      "patched": "c8308a5341fc8f6fb6c819ed62c690759a655bbbaa62b0f1d8842005c6fe7547"
+      "orig": [
+        "6c04753fd3d98b78b6711c406a9d31fce9376d5eb6a1b5d61106e5ea9fa19bf7",
+        "d80a055c009650f88da6be608a51697360e56f19f8dd3537d90a281722ecd7f0"
+      ],
+      "patched": [
+        "c8308a5341fc8f6fb6c819ed62c690759a655bbbaa62b0f1d8842005c6fe7547",
+        "997d2bcfe43845a3ea49495e615664f1f37e6e83220ab24bc5b8e2107865e033"
+      ]
     }
   }
 }

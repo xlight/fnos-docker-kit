@@ -58,6 +58,9 @@
 #      "mirror":{"archive":"usr/trim/share/.restore/www.zip"}}
 #   ]
 # }
+#
+# 掩码语义：match / replace.find 里的 "?"（或 "??"）= 通配任意字节；
+# replace.to 里的 "?" = **保留原字节**（用于"只改其中一段、其余原样搬运"的替换）。
 # ============================================================================
 import argparse
 import datetime
@@ -278,18 +281,8 @@ def process_patch(rootfs, p, fh=None):
         rec["status"] = "already"; return rec, True
     if len(hits) != p.get("expect", 1):
         rec["status"] = "expect-mismatch(%d!=%d)" % (len(hits), p.get("expect", 1)); return rec, False
-    # 逐匹配替换
-    for hh in hits:
-        for r in p["replace"]:
-            fpat = parse_pattern(r["find"]); tpat = parse_pattern(r["to"])
-            i = 0
-            while i + len(fpat) <= len(pat):
-                if all(fpat[k] is None or data[hh + i + k] == fpat[k] for k in range(len(fpat))):
-                    for k in range(len(fpat)):
-                        data[hh + i + k] = tpat[k] if not isinstance(tpat[k], tuple) else tpat[k][1]
-                    i += len(fpat)
-                else:
-                    i += 1
+    # 逐匹配替换（与 best-effort 路径共用同一实现：to 里的 '?' = 保留原字节）
+    _apply_replaces(data, pat, hits, p)
     # 打后校验：原特征在**目标位置**应消失（应用后特征是否在别处重复存在与本 patch 无关）
     ok = not find_all(data, pat, lo, hi)
     rec["status"] = "applied" if ok else "verify-failed"
@@ -634,10 +627,14 @@ def _apply_replaces(data, pat, hits, p):
     for hh in hits:
         for r in p["replace"]:
             fpat = parse_pattern(r["find"]); tpat = parse_pattern(r["to"])
+            if len(tpat) != len(fpat):
+                raise ValueError("replace find/to 长度不一致: id=%s" % p.get("id", "?"))
             i = 0
             while i + len(fpat) <= len(pat):
                 if all(fpat[k] is None or data[hh + i + k] == fpat[k] for k in range(len(fpat))):
                     for k in range(len(fpat)):
+                        if tpat[k] is None:
+                            continue          # to 里的 '?' = 保留原字节
                         data[hh + i + k] = tpat[k] if not isinstance(tpat[k], tuple) else tpat[k][1]
                     i += len(fpat)
                 else:
