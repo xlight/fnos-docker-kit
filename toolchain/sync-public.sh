@@ -78,7 +78,7 @@ LEAK_RES=(
 )
 
 stage_build() { # <stage-dir>
-  local stage="$1" line f src dst
+  local stage="$1" line f src dst missing=0
   rm -rf "$stage"; mkdir -p "$stage"
   while IFS= read -r line; do
     case "$line" in ""|\#*|\[*) continue;; esac
@@ -86,20 +86,28 @@ stage_build() { # <stage-dir>
     if [[ "$line" == *"=>"* ]]; then
       src="$(echo "${line%%=>*}" | xargs)"; dst="$(echo "${line##*=>}" | xargs)"
       f="$REPO_ROOT/$src"
-      [ -e "$f" ] || { log "WARN: 清单项缺失（跳过）: $src"; continue; }
+      # 清单即契约：声明了却不存在的条目 = 中止（不静默少文件）
+      if [ ! -e "$f" ]; then log "清单项缺失: $src"; missing=1; continue; fi
       mkdir -p "$stage/$(dirname "$dst")"
       cp -a "$f" "$stage/$dst"
       continue
     fi
-    # glob 展开（patches/fnos-*.json 等）
+    # glob 展开（patches/fnos-*.json 等）：**glob 无匹配不算缺失**（例如还没有任何
+    # 修正证据时 evidence/*.json 为空）；字面路径缺失 = 清单条目失效 → 中止。
+    local had_glob=0
+    case "$line" in *'*'*|*\?*) had_glob=1;; esac
     # shellcheck disable=SC2086
     for f in $REPO_ROOT/$line; do
-      [ -e "$f" ] || { log "WARN: 清单项缺失（跳过）: $line"; continue 2; }
+      if [ ! -e "$f" ]; then
+        if [ "$had_glob" = "1" ]; then log "清单 glob 无匹配（跳过）: $line"; continue; fi
+        log "清单项缺失: $line"; missing=1; continue 2
+      fi
       local rel="${f#$REPO_ROOT/}"
       mkdir -p "$stage/$(dirname "$rel")"
       cp -a "$f" "$stage/$rel"
     done
   done < <(parse_include)
+  [ "$missing" = 0 ] || die "公开清单有条目在工作树中不存在（清单即契约），中止（不提交不推送）"
   log "暂存区组装完成: $stage"
 }
 
@@ -108,8 +116,7 @@ leak_scan() { # <stage-dir>
   for pat in "${LEAK_RES[@]}"; do
     while IFS= read -r hit; do
       printf '[sync-public] LEAK %s: %s\n' "$pat" "$hit" >&2; hits=1
-    done < <(grep -rnE --exclude-dir=.git --exclude=public-manifest.txt \
-               --exclude=sync-public.sh --exclude=publish.sh "$pat" "$stage" 2>/dev/null | head -5)
+    done < <(grep -rnE --exclude-dir=.git --exclude=sync-public.sh --exclude=publish.sh "$pat" "$stage" 2>/dev/null | head -5)
   done
   [ "$hits" = 0 ] || die "leak-scan 命中 $hits 类模式，中止（不提交不推送）"
   log "leak-scan 通过（0 命中）"
@@ -117,6 +124,32 @@ leak_scan() { # <stage-dir>
 
 tree_hash() { # <stage-dir> -> 内容哈希（排除 git）
   (cd "$1" && find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+}
+
+# 公开形态的清单：只留**公开段**（INCLUDE / PRESERVE）。
+# 排除清单里的**私有文件名**本身即敏感信息（推导工具 / 逆向机制脚本 / rebase 方法论），
+# 公开它们等于把边界写进公开树——实测公开清单曾含 12 处 leak 模式命中。
+redact_manifest() { # <stage-dir>
+  local stage="$1" mf="$stage/toolchain/public-manifest.txt"
+  [ -f "$mf" ] || return 0
+  python3 - "$mf" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+secs, cur = {}, None
+for line in open(p, encoding='utf-8').read().splitlines():
+    m = re.match(r'^\[([^\]]+)\]', line)   # 段头可能是 [GRAY — 结论（…）] 这类带中文的
+    if m:
+        cur = m.group(1); secs.setdefault(cur, []); continue
+    if cur:
+        secs[cur].append(line)
+out = ["# 公开清单（公开形态）",
+       "# 只含公开段：公开集实际包含什么，以及哪些路径不由私有真源产出但必须保留。",
+       "# 私有真源侧的排除清单不在此列出——那些文件名本身即敏感信息（推导工具 /",
+       "# 逆向机制脚本 / rebase 方法论）；完整清单保存在私有真源，不公开。", "",
+       "[INCLUDE]"] + secs.get('INCLUDE', []) + ["", "[PRESERVE]"] + secs.get('PRESERVE', []) + [""]
+open(p, 'w', encoding='utf-8').write("\n".join(out))
+PYEOF
+  log "公开清单已裁成公开视图（去掉排除段里的私有文件名）"
 }
 
 # 逐文件脱敏（在 leak-scan 之前；规则有增补时同步更新 LEAK_RES 注释）
@@ -141,7 +174,14 @@ for x in d.get("patches", []):
 json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)
 PYEOF
   done
-  log "脱敏规则已应用（derived_from_table 去私有路径；reason 去方法细节）"
+  redact_manifest "$stage"
+  # 证据文件脱敏（进仓的两类：intent / behavior）：宿主地址、容器标识、账号不外泄
+  local ev
+  for ev in "$stage"/toolchain/patches/evidence/*.json; do
+    [ -f "$ev" ] || continue
+    python3 "$REPO_ROOT/toolchain/evidence.py" scrub "$ev" >/dev/null 2>&1 || true
+  done
+  log "脱敏规则已应用（derived_from_table 去私有路径；reason 去方法细节；清单裁成公开视图；证据脱敏）"
 }
 
 # 在 desensitize 之后生成就绪索引：sha256 必须对**脱敏后的 staged 文件**计算，

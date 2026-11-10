@@ -103,6 +103,48 @@ def coverage_for(file_hashes, sample_files):
             "missing": missing}
 
 
+def _semantic(idx):
+    """去掉 revision / generated / source_commit 后的语义体（幂等比较用）。
+
+    source_commit 指向"内容提交"：内容变了而补丁集没变时，它会变，但索引的**语义**
+    没变 —— 此时保留旧字节即可（旧 source_commit 指向的提交仍含同样的补丁集字节，
+    按它固定下载依然拿到一致内容），不必为此前进 revision。
+    """
+    b = json.loads(json.dumps(idx))
+    b.pop("revision", None)
+    b.pop("generated", None)
+    for e in (b.get("versions") or {}).values():
+        e.pop("source_commit", None)
+    return b
+
+
+def _keep_base_if_same(idx, base_file, pdir):
+    """索引语义与基线一致 → 保留基线字节（revision 不前进、generated 不变）。
+
+    仅当基线**已经带 source_commit** 时才保留：首次生成时基线可能还没有
+    source_commit（例如公开仓里的旧索引），那一次必须补上（容器按提交固定下载
+    依赖它），不能因为"语义相同"而一直缺着。
+    """
+    if not base_file or not os.path.isfile(base_file):
+        return None
+    try:
+        old = json.load(open(base_file, encoding="utf-8"))
+    except Exception:
+        return None
+    if _semantic(old) != _semantic(idx):
+        return None
+    old_versions = old.get("versions") or {}
+    if not old_versions or any(not (e or {}).get("source_commit") for e in old_versions.values()):
+        log("基线索引缺 source_commit → 本次补上（不保留旧字节）")
+        return None
+    with open(base_file, "rb") as f:
+        raw = f.read()
+    with open(os.path.join(pdir, "index.json"), "wb") as f:
+        f.write(raw)
+    log("索引语义未变 → 保留基线字节（revision 不前进）")
+    return old
+
+
 def build(stage, slug=None, source_commit="", revision=None, offline=False, base_file=None):
     pdir = os.path.join(stage, "toolchain", "patches")
     versions = {}
@@ -166,6 +208,10 @@ def build(stage, slug=None, source_commit="", revision=None, offline=False, base
         idx["samples"] = samples
     if coverage:
         idx["coverage"] = coverage
+    # 幂等：语义未变 → 保留基线字节（不递增 revision、不改 generated）
+    old = _keep_base_if_same(idx, base_file, pdir)
+    if old is not None:
+        return old
     out = json.dumps(idx, ensure_ascii=False, indent=2) + "\n"
     with open(os.path.join(pdir, "index.json"), "w", encoding="utf-8") as f:
         f.write(out)

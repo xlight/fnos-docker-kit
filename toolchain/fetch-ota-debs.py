@@ -102,6 +102,15 @@ def main():
         if only and not any(s in (p.get("packageName") or "") for s in only):
             continue
         entries.append(p)
+    # **顶层条目也要下**（design D15）：官方 manifest 除了 packages[] 还有
+    # liveupdate / kernel / fixapt 三个顶层条目。历史上这里只取 packages[]，
+    # 于是 CI 的 deb-head rootfs 缺 LiveUpdate 包 → liveupdate 仍是旧 build
+    # → 补丁集判 ready 而真容器 no-match（2026-11-09 实测）。
+    if not only:
+        for k in ("liveupdate", "kernel", "fixapt"):
+            e = man.get(k)
+            if isinstance(e, dict):
+                entries.append(e)
     if not a.skip_scripts:
         entries += [man[k] for k in ("preupdate", "postupdate") if isinstance(man.get(k), dict)]
     os.makedirs(a.out, exist_ok=True)
@@ -114,6 +123,27 @@ def main():
     except Exception as e:
         print(json.dumps({"error": str(e)[:300], "done": results}), flush=True)
         return 1
+    # **覆盖完整性门**：manifest 里声明的可下载条目必须全部取到（否则 rootfs 不完整，
+    # 后续 aobpatch check 的结论对真容器不可信）。漏一个顶层条目就在这里炸掉，
+    # 而不是等到"CI 判 ready、真容器 no-match"。
+    if not only and not a.skip_scripts:
+        want = {}   # 下载文件名 -> 期望 sha256（manifest 的 sign）
+        for p in man.get("packages", []):
+            want[p["url"].rsplit("/", 1)[-1]] = p.get("sign")
+        for k in ("liveupdate", "kernel", "fixapt"):
+            e = man.get(k)
+            if isinstance(e, dict):
+                want[e["url"].rsplit("/", 1)[-1]] = e.get("sign")
+        got = {}
+        for r in results:
+            f = r.get("file")
+            p = os.path.join(a.out, f) if f else ""
+            got[f] = hashlib.sha256(open(p, "rb").read()).hexdigest() if p and os.path.isfile(p) else None
+        missing = [n for n, s in want.items() if got.get(n) is None or (s and got.get(n) != s)]
+        if missing:
+            print(json.dumps({"error": "ota-incomplete: 清单条目未取全", "missing": missing,
+                              "fetched": sorted(got)}, ensure_ascii=False), flush=True)
+            return 3
     print(json.dumps({"version": a.version, "files": results,
                       "total_bytes": sum(r["size"] for r in results)}, ensure_ascii=False))
     return 0

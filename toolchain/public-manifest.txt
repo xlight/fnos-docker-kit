@@ -1,7 +1,7 @@
-# public-manifest（allowlist）：公开仓文件集
-# 配套 change：fnos-public-release-split（任务 1.1）
-# 语义：INCLUDE = 进入公开仓；EXCLUDE-PRIVATE = 永不公开；GRAY = 见任务 1.2 结论。
-# 脱敏改造见任务 2.x（本清单只定边界，不管脱敏状态）。
+# 公开清单（公开形态）
+# 只含公开段：公开集实际包含什么，以及哪些路径不由私有真源产出但必须保留。
+# 私有真源侧的排除清单不在此列出——那些文件名本身即敏感信息（推导工具 /
+# 逆向机制脚本 / rebase 方法论）；完整清单保存在私有真源，不公开。
 
 [INCLUDE]
 # -- toolchain: 构建最小集 --
@@ -22,6 +22,8 @@ toolchain/s9-shim-check.py
 toolchain/deps.sh
 toolchain/patches/fnos-*.json
 toolchain/patches/index.json
+toolchain/patches/evidence/*.json
+toolchain/patches/evidence/README.md
 toolchain/assets/libfnos-trashshim.so
 toolchain/tests/selftest.sh
 toolchain/tests/pipeline_test.sh
@@ -37,6 +39,7 @@ toolchain/tests/patch_status_test.py
 toolchain/tests/proxy-test.py
 toolchain/tests/release-guard-test.sh
 toolchain/tests/required-files-test.py
+toolchain/tests/evidence-test.py
 toolchain/tests/iso-detect-test.sh
 toolchain/tests/watch-issue-test.py
 toolchain/tests/build-issue-test.py
@@ -45,6 +48,10 @@ toolchain/tests/fingerprints-test.py
 toolchain/tests/patchset-fetch-test.py
 toolchain/tests/index-matrix-test.py
 toolchain/index_builder.py
+toolchain/fnos_rootfs.py
+toolchain/release-content.sh
+toolchain/check-release-tag.sh
+toolchain/derive-release-tag.py
 # -- scripts: 部署/存储（LXC + Docker） --
 scripts/lib.sh
 scripts/stor-manage.sh
@@ -64,6 +71,7 @@ toolchain/ci-public/public-release.yml => .github/workflows/public-release.yml
 toolchain/ci-public/watch-issue.py => .github/scripts/watch-issue.py
 toolchain/ci-public/build-issue.py => .github/scripts/build-issue.py
 toolchain/ci-public/fingerprints.py => .github/scripts/fingerprints.py
+toolchain/ci-public/validate_patchset.py => .github/scripts/validate_patchset.py
 # -- 发布工具三件套（发布链路公开可复现） --
 toolchain/publish.sh
 toolchain/sync-public.sh
@@ -75,69 +83,6 @@ toolchain/fnos_docker_compose.yml
 toolchain/README.public.md => README.md
 toolchain/docs/public-usage.md
 
-[EXCLUDE-PRIVATE]
-# 生成/分析工具与输入
-toolchain/aobderive.py
-scripts/fnos-dirfd-shim.py
-toolchain/REBASE.md
-# 逆向机制脚本
-scripts/net-n1-bond.sh
-scripts/net-n2-hwsim.sh
-scripts/net-n3-patch-rodata.sh
-scripts/net-n4-patch-web.sh
-scripts/net-all.sh
-scripts/net-verify.sh
-scripts/net-ovs-recover.sh
-scripts/n3_rodata.py
-scripts/ovs-guard.sh
-scripts/ovs-vsctl
-scripts/fnos-memview.sh
-scripts/fnos-dmi-memview-gen.py
-scripts/memview-dmi.service
-scripts/smoke-memview.sh
-scripts/mech-map.sh
-scripts/rollback-verify.sh
-# 实验性/诊断脚本（无公开调用或硬编码私有主机）
-scripts/stor-prep.sh
-scripts/stor-baseline.sh
-# 站内运维台（内容无泄密但属单宿主运维范围，与公开仓最小构建集不符；
-# 其回归 tests/tui_test.sh 引用公开仓不存在的文件，一并 EXCLUDE）
-scripts/fnos-ops-tui.py
-toolchain/tests/tui_test.sh
-# 宿主特异配置（含本机 USB 序列号硬件指纹，公开构建无用；fnos-usb-passthrough 1.2）
-scripts/99-fnos-usb.rules
-scripts/99-no-usb-autosuspend.rules
-# USB 直通链机制脚本（宿主单机身份链，公开构建无用；fnos-usb-passthrough）
-scripts/stor-usb.sh
-scripts/stor-usb-stack.sh
-# 容器防护编排与回归（宿主单机防护/恢复手册配套；fnos-ct-guard）
-scripts/fnos-ct-guard.sh
-toolchain/tests/ct-guard-test.sh
-# 应用环境修复（容器内 app 服务用户通行权等，可重放；fnos-app-env）
-scripts/fnos-app-env.sh
-# 调查记录与备份
-01-analysis-network.md
-02-analysis-storage.md
-03-host-safety-md-lvm.md
-04-solution-network.md
-05-solution-storage.md
-06-storage-feasibility.md
-07-storage-implementation.md
-08-app-install-and-activation.md
-09-mountdir-options.md
-10-filemanager-write-deepdive.md
-11-dirfd-shim.md
-12-lxc-image-pipeline-spike.md
-13-lxc-image-pipeline.md
-14-storage-vol-btrfs-zfs.md
-15-dirfd-magic-inventory.md
-16-trash-usermode.md
-17-disk-io-monitor.md
-18-storage-activation-dm.md
-19-docker-mode.md
-19-mem-total-ui-view.md
-20-docker-user-guide.md
-backups/
 
 [PRESERVE]
 # 不由私有真源产出、但必须留在公开仓里的路径（同步擦树时保留）。
@@ -145,13 +90,3 @@ backups/
 # state/ 由公开 CI 的观察单元提交（检测器双通道版本记录）。
 state/
 
-[GRAY — 结论（任务 1.2，已定）]
-# .so INCLUDE：构建资产（fnos_patch.py 烘焙进镜像），无方法信息
-# .c EXCLUDE：源码泄漏 unlinkat 魔数语义与搬运算法（fnos_patch.py 仅注释提及，无运行时依赖）
-# .extras.list EXCLUDE：仅被私有的 aobderive.py 消费；公开构建不需要
-# fnos_rpc.py EXCLUDE：RPC 探针含登录签名逆向方法；连带 memview_test.sh 一并 EXCLUDE（其 RPC 变量默认指向它）
-# tests/* 其余 INCLUDE：selftest/pipeline_test/backends/deploy-test/storage-fs-test/disk-io-monitor/nic_test 均无私有引用
-toolchain/assets/fnos-trashshim.c
-toolchain/patches/fnos-*.extras.list
-scripts/fnos_rpc.py
-toolchain/tests/memview_test.sh

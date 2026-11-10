@@ -685,6 +685,49 @@ exit 0
 
 
 # ---------------------------------------------------------------------------
+# tier-B 指纹（容器自报当前文件哈希）
+# ---------------------------------------------------------------------------
+
+def write_tierb_fingerprint(out_path):
+    """写出本机二进制指纹（tier-B）。只留本地：它不进公开索引、不参与 ready/partial 判定，
+    只用来回答"CI 造出来的校验环境，和真容器差多少"。"""
+    import datetime
+    import hashlib
+    mode, ps_path = select_patchset()
+    files = {}
+    if ps_path:
+        try:
+            ps = json.load(open(ps_path, encoding="utf-8"))
+            for rel in (ps.get("file_hashes") or {}).keys():
+                p = os.path.join("/", rel)
+                if os.path.isfile(p):
+                    try:
+                        files[rel] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    ver = ""
+    try:
+        ver = open(VERSION_PATH).read().strip().lstrip("Vv")
+    except OSError:
+        pass
+    doc = {"version": ver,
+           "source": "tier-B",
+           "state": "installed",
+           "files": dict(sorted(files.items())),
+           "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    d = os.path.dirname(os.path.abspath(out_path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    print("fingerprint: tier-B 指纹已写入 %s（%d 文件，patchset=%s）"
+          % (out_path, len(files), os.path.basename(ps_path) if ps_path else "-"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -705,6 +748,9 @@ def main():
                         help="With --auto-fix: also apply binary patches live and restart trim_main")
     parser.add_argument("--exit-code", action="store_true",
                         help="Exit with non-zero on issues (default behavior)")
+    parser.add_argument("--fingerprint", default="",
+                        help="写出本机（tier-B）二进制指纹 JSON：容器自报的当前文件哈希，"
+                             "用于与 CI 的校验环境做交叉核对；**只留本地，不进公开索引**")
     args = parser.parse_args()
 
     # Run detection
@@ -721,6 +767,15 @@ def main():
 
     all_issues = aob.get("issues", []) + mech.get("issues", []) + image.get("issues", [])
     all_healthy = len(all_issues) == 0
+
+    # tier-B 指纹（容器自报）：只留本地，用于"CI 造出的校验环境像不像真容器"的交叉核对
+    if args.fingerprint:
+        try:
+            write_tierb_fingerprint(args.fingerprint)
+        except Exception as e:
+            print("fingerprint 写出失败: %s" % e, file=sys.stderr)
+            return 2
+        return 0
 
     result = {
         "healthy": all_healthy,

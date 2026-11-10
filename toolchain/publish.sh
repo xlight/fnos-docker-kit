@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================================
-# publish.sh —— 声明式发布命令（design D3/D8/D9）
+# publish.sh —— 声明式发布命令（人工旁路 / 逃生舱；design D3/D8/D9/D13/D16）
 #
 #   publish.sh --patchset <ver> [--image <ver>] [--release-tag <tag>]
 #              [--dry-run] [--repo <公开仓工作区>]
 #
 # 做什么：
 #   1) 8 项预检（任何一项不过 → 非零退出，**远端零副作用**）
-#   2) 两段提交：commit#1 = 内容，commit#2 = 带 source_commit 的就绪索引
-#   3) 发布 tag 不可变（已存在且合规 → 幂等跳过；不合规 → 报错拒绝）
-#   4) 主分支与 tag 一次原子推送（要么都生效，要么都不生效）
-#   5) 可选 --image <ver>：发布成功后 dispatch 一次镜像构建（不等待、不回滚）
+#   2) 内容落地：两段提交（commit#1 = 内容，commit#2 = 带 source_commit 的就绪索引）
+#      + 一次推送（两个提交同时到达，消费者读不到中间态）——由 release-content.sh 执行
+#   3) **不建 tag、不推 tag**：tag 的唯一创建者是发布单元（public-release.yml）；
+#      本脚本只 dispatch 它（tag 不可变判定与修订号推导与发布单元共用同一份实现）
+#   4) 可选 --image <ver>：发布后 dispatch 一次镜像构建（不等待、不回滚）
 #
-# 公开可复现：本脚本与 sync-public.sh、public-manifest.txt 一起进公开仓。
+# 自动路径（搬运单元）与本旁路共用 release-content.sh / check-release-tag.sh /
+# derive-release-tag.py —— 避免两套实现产生两套语义。
+#
+# 公开可复现：本脚本与 sync-public.sh、release-content.sh、public-manifest.txt 一起进公开仓。
 # 脚本内**不得**硬编码宿主私有绝对路径（一律 $HOME 或参数）。
 # ============================================================================
 set -uo pipefail
@@ -48,12 +52,22 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PATCHSET_VER" ] || { usage; }
 PATCHSET_VER="${PATCHSET_VER#V}"
-[ -n "$RELEASE_TAG" ] || RELEASE_TAG="v${PATCHSET_VER}"
+# tag 默认**自动推导**（v<ver> 或 v<ver>-r<N+1>，与发布单元同一份实现）；
+# 显式 --release-tag 优先。
+TAG_AUTO=0
+[ -n "$RELEASE_TAG" ] || TAG_AUTO=1
 
 PRIVATE_PS="$SCRIPT_DIR/patches/fnos-${PATCHSET_VER}.json"
 REHEARSE_REC="${FNOS_REHEARSE_DIR:-$HOME/fnos/backups/rehearsal}/fnos-${PATCHSET_VER}.json"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+
+# 自动推导发布 tag（首发 v<ver>；修正 v<ver>-r<N+1>；查询失败 → fail-closed）
+if [ "$TAG_AUTO" = "1" ]; then
+  RELEASE_TAG="$(python3 "$SCRIPT_DIR/derive-release-tag.py" --repo "$PUB_REPO" --version "$PATCHSET_VER")" \
+    || die "无法推导发布 tag（远端查询失败，fail-closed，不发布）"
+  log "自动推导发布 tag: $RELEASE_TAG"
+fi
 
 FAILED=0
 precheck() { # <名称> <说明>；返回 0=通过
@@ -107,14 +121,14 @@ precheck p3
 
 # ---------- 预检 4：目标 tag 不存在，或已存在且内容合规 ----------
 PRECHECK_NAME="[4] 目标 tag 不存在或已存在且内容合规"
-PRECHECK_DESC="tag $RELEASE_TAG 已存在但内容与本次发布不符（tag 不可变）"
+PRECHECK_DESC="tag $RELEASE_TAG 已存在但内容与本次发布不符（tag 不可变）；或查询失败（fail-closed）"
 p4() {
-  git -C "$PUB_REPO" rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null || return 0
-  # 已存在：校验其补丁集哈希是否等于本次（脱敏后）补丁集哈希
-  local want got
-  want=$(sha256sum "$STAGE/toolchain/patches/fnos-${PATCHSET_VER}.json" 2>/dev/null | awk '{print $1}')
-  got=$(git -C "$PUB_REPO" show "$RELEASE_TAG:toolchain/patches/fnos-${PATCHSET_VER}.json" 2>/dev/null | sha256sum | awk '{print $1}')
-  [ -n "$want" ] && [ "$want" = "$got" ]
+  # 共享实现（发布单元与人工旁路同一份判定；查询失败 → fail-closed，视为不通过）
+  bash "$SCRIPT_DIR/check-release-tag.sh" --repo "$PUB_REPO" --tag "$RELEASE_TAG" \
+    --patchset-file "$STAGE/toolchain/patches/fnos-${PATCHSET_VER}.json" >/dev/null 2>"$STAGE/.tag-err"
+  local rc=$?
+  [ "$rc" = 2 ] && tail -2 "$STAGE/.tag-err" >&2
+  return $rc
 }
 precheck p4
 
@@ -197,65 +211,25 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 # ================= 执行 =================
-log "拉平基线（与 CI 的 state 提交并发时先 rebase）"
-git -C "$PUB_REPO" pull --rebase --autostash origin main || die "pull --rebase 失败"
+log "内容落地（两段提交 + 一次推送；tag 由发布单元创建）"
+out="$(bash "$SCRIPT_DIR/release-content.sh" --repo "$PUB_REPO" --message "publish")" \
+  || die "内容落地失败（远端保持原状）"
+printf '%s\n' "$out" | while IFS= read -r line; do log "  $line"; done
 
-log "组装公开内容（两段提交的第一段：内容，不含索引）"
-# 旧索引先留档：它既是新 revision 的基线（公开仓为准），也要留到第二段再生成
-if [ -f "$PUB_REPO/toolchain/patches/index.json" ]; then
-  cp "$PUB_REPO/toolchain/patches/index.json" "$STAGE/index-base.json"
-fi
-preserve_tmp="$(mktemp -d)"
-while IFS= read -r rel; do
-  [ -n "$rel" ] || continue
-  if [ -e "$PUB_REPO/$rel" ]; then
-    mkdir -p "$preserve_tmp/$(dirname "$rel")"
-    cp -a "$PUB_REPO/$rel" "$preserve_tmp/$rel"
-  fi
-done < <(bash "$SCRIPT_DIR/sync-public.sh" preserve-list 2>/dev/null)
-(cd "$PUB_REPO" && git ls-files -z | xargs -0 -r rm -f; find . -path ./.git -prune -o -type d -empty -delete)
-cp -a "$STAGE/." "$PUB_REPO/"
-if [ -n "$(ls -A "$preserve_tmp" 2>/dev/null)" ]; then
-  (cd "$preserve_tmp" && find . -type f -print0) | while IFS= read -r -d "" f; do
-    mkdir -p "$PUB_REPO/$(dirname "$f")"
-    cp -a "$preserve_tmp/$f" "$PUB_REPO/$f"
-  done
-fi
-rm -rf "$preserve_tmp"
-# 索引挪到第二段提交
-mkdir -p "$PUB_REPO/toolchain/patches"
-mv "$PUB_REPO/toolchain/patches/index.json" "$STAGE/index.json.pending" 2>/dev/null || true
-
-git -C "$PUB_REPO" add -A
-git -C "$PUB_REPO" commit -q -m "publish: 内容 $(date -u +%Y%m%dT%H%M%SZ)" || die "commit#1 失败"
-COMMIT1="$(git -C "$PUB_REPO" rev-parse HEAD)"
-log "commit#1 = $COMMIT1"
-
-log "生成索引（source_commit = commit#1）"
-mkdir -p "$PUB_REPO/toolchain/patches"
-INDEX_BASE_FILE="$STAGE/index-base.json" \
-INDEX_SOURCE_COMMIT="$COMMIT1" \
-  bash "$SCRIPT_DIR/sync-public.sh" gen-index "$PUB_REPO" >/dev/null || die "索引生成失败"
-git -C "$PUB_REPO" add toolchain/patches/index.json
-git -C "$PUB_REPO" commit -q -m "publish: 索引 revision+1 (source_commit=$COMMIT1)" || die "commit#2 失败"
-COMMIT2="$(git -C "$PUB_REPO" rev-parse HEAD)"
-log "commit#2 = $COMMIT2"
-
-if git -C "$PUB_REPO" rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
-  log "tag $RELEASE_TAG 已存在且内容合规 → 幂等跳过（不移动 tag）"
-else
-  git -C "$PUB_REPO" tag "$RELEASE_TAG" "$COMMIT2" || die "打 tag 失败"
-fi
-
-log "原子推送（main + tag 一起生效）"
-git -C "$PUB_REPO" push --atomic origin main "$RELEASE_TAG" || die "原子推送失败（远端保持原状）"
+# 触发发布单元（建 tag + 发 Release 资产）——tag 的**唯一创建者**是它
+pub_repo_slug="$(git -C "$PUB_REPO" remote get-url origin 2>/dev/null \
+  | sed -E 's#^https?://[^/]+/##; s#^git@[^:]+:##; s#\.git$##')"
+log "触发发布单元 public-release.yml：patchset=$PATCHSET_VER tag=$RELEASE_TAG"
+gh workflow run public-release.yml -R "${pub_repo_slug:-xlight/fnos-docker-kit}" \
+   -f patchset="$PATCHSET_VER" -f release_tag="$RELEASE_TAG" \
+  || log "WARN: 发布单元 dispatch 失败（内容已落地，可手工重跑 public-release.yml）"
 
 # 审计链
 if [ -f "$REPO_ROOT/scripts/lib.sh" ]; then
   # shellcheck source=/dev/null
   source "$REPO_ROOT/scripts/lib.sh" >/dev/null 2>&1 || true
   if command -v manifest_add >/dev/null 2>&1; then
-    manifest_add "$(python3 -c 'import json,sys; print(json.dumps({"mech":"release","action":"publish","version":sys.argv[1],"tag":sys.argv[2]},ensure_ascii=False))' "$PATCHSET_VER" "$RELEASE_TAG")" || true
+    manifest_add "$(python3 -c 'import json,sys; print(json.dumps({"mech":"release","action":"publish","version":sys.argv[1],"tag":sys.argv[2],"stage":"content-landed"},ensure_ascii=False))' "$PATCHSET_VER" "$RELEASE_TAG")" || true
   fi
 fi
 

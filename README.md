@@ -3,16 +3,21 @@
 从飞牛 fnOS **官方 ISO** 构建容器镜像的最小公开集（补丁施加器、版本化补丁集、
 成像工具、编排器、部署脚本、自测），配合你自己的官方 ISO 使用。
 
-本仓把发布拆成三个单元：**观察**（每天探测新版，只开一条可见的状态 Issue）、
-**构建**（显式声明才出镜像）、**发布**（显式声明才发补丁集 Release）。
+本仓把发布拆成四个单元：**观察**（每天探测新版，只开一条可见的状态 Issue）、
+**搬运**（私有真源每次提交都自动同步到本仓）、**发布**（分级触发：新版本首发由机器取证
+自动发布，同版本修正需人工证据）、**构建**（显式声明才出镜像）。
 
 ```bash
 # 1) 看有没有新版（观察单元每天自动跑；这里可手动触发）
 gh workflow run public-watch.yml
 
-# 2) 有新版 → 人工 rebase 出补丁集 → 本地演练 → 声明发布（并触发镜像构建）
-sudo bash toolchain/rehearse-build.sh --version 1.2.1000
-bash toolchain/publish.sh --patchset 1.2.1000 --image 1.2.1000
+# 2) 有新版 → 人工 rebase 出补丁集 → 提交回真源（搬运单元自动同步，发布单元自动取证发布）
+#    首发：机器在出厂件上逐站验哈希 → 通过即发 v<ver>
+#    修正：还要人工产出的「意图 + 行为验收」两份证据（绑定补丁集 sha256）
+sudo bash toolchain/rehearse-build.sh --version 1.2.1000        # 可选：本地预演
+bash toolchain/publish.sh --patchset 1.2.1000 --image 1.2.1000 # 需要镜像时显式构建
 ```
+
+每一次发布都带**可公开核验的证据**（校验环境来源、逐站命中数、出厂指纹），随 Release 资产发布。
 
 完整用法见 [toolchain/docs/public-usage.md](toolchain/docs/public-usage.md)（安装/构建/部署/边界/免责声明/协作规则）。

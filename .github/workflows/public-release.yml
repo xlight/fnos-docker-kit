@@ -1,86 +1,313 @@
-# 公开 CI 发布单元：**补丁集发布**（显式声明触发；不构建、不检测）
-# 设计来源：streamline-public-release-flow D1（观察/构建/发布三单元）、D8（预检）、D4（tag 不可变）
+# 公开 CI 发布单元：**补丁集发布**（分级触发；不构建、不检测）
+# 设计来源：auto-follow-release-with-evidence D13（分级触发）/ D14（证据体系）/
+#           D15（校验三态）/ D16（两阶段落地）/ D17（声明两种载体）
 #
-# 触发：workflow_dispatch，由发布声明（publish.sh --patchset <ver>）驱动。
-#   - 消费显式声明参数（patchset 版本 / 发布 tag），不猜、不自动发布。
-#   - 发布前校验就绪索引与补丁集自洽（索引条目 sha256 == 补丁集实际哈希）。
-#   - tag 不可变：已存在且内容合规 → 幂等跳过；已存在但内容不符 → 报错拒绝。
-#   - 重复触发不产生重复资产（--clobber 覆盖同名资产）。
+# 触发：
+#   - push 到 main 且改了 toolchain/patches/** → **自动路径**（搬运单元推完内容后自动走这里）
+#   - push tag（v*）→ 归档补齐（tag 已存在但资产缺失时重跑补齐）
+#   - workflow_dispatch → 人工重跑（发布声明：patchset / release_tag）
 #
-# 镜像构建是**另一个单元**：发布成功后的镜像构建由 publish.sh --image <ver>
-# dispatch public-ci.yml；两个单元互不 needs。
+# 分级（design D13）：
+#   首发（新 fnOS 版本，v<ver> 不存在）→ 字节级证据通过即发
+#   修正（v<ver> 已存在）→ 还要 intent + behavior 两份人工证据（绑定同一补丁集 sha）
+#   判据是**目标发布 tag 是否已存在**，不是就绪索引条目（索引会被本次同步改写）
+#
+# tag 不可变：已存在且内容合规 → 幂等跳过；已存在但内容不符 → 报错拒绝；
+#             存在性查询失败 → fail-closed（不创建、不覆盖）
+#
+# 镜像构建是**另一个单元**（public-ci.yml），两者互不 needs。
 name: public-release
 
 on:
   workflow_dispatch:
     inputs:
       patchset:
-        description: "要发布的补丁集版本（如 1.2.1000）"
-        required: true
-      release_tag:
-        description: "发布 tag（留空 = v<patchset>；修正已发布内容请用新的修订号，如 v1.2.1000-r2）"
+        description: "补丁集版本（如 1.2.1000；留空 = 自动判定本次推送涉及的版本）"
         required: false
         default: ""
+      release_tag:
+        description: "发布 tag（留空 = 自动推导 v<ver> 或 v<ver>-r<N+1>）"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'toolchain/patches/**'
 
 permissions:
   contents: read
 
+concurrency:
+  group: public-release-${{ github.event.inputs.patchset || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  # ------------------------------------------------------------------
+  resolve:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      mode: ${{ steps.plan.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 判定本次要发布的版本与 tag
+        id: plan
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.patchset }}"
+          tag="${{ inputs.release_tag }}"
+          mode="dispatch"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              mode="tag-push"
+              ver="${GITHUB_REF_NAME#v}"; ver="${ver%-r*}"
+            else
+              mode="main-push"
+              # 本次推送涉及的补丁集（取版本号最大的那个）
+              ver=$(git diff --name-only "${{ github.event.before }}" "$GITHUB_SHA" -- toolchain/patches/ \
+                    | sed -n 's#.*fnos-\([0-9.]*\)\.json#\1#p' | sort -V | tail -1 || true)
+            fi
+          fi
+          if [ -z "$ver" ]; then
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "mode=$mode" >> "$GITHUB_OUTPUT"
+            echo "::notice::本次触发没有补丁集变更 → 不发布"
+            exit 0
+          fi
+          ver="${ver#V}"
+          if [ -z "$tag" ]; then
+            # 修订号推导与人工旁路共用同一份实现（derive-release-tag.py）
+            tag=$(python3 toolchain/derive-release-tag.py --repo . --version "$ver") \
+              || { echo "::error::tag 推导失败（fail-closed，不发布）"; exit 1; }
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "PLAN: version=$ver tag=$tag mode=$mode"
+
+  # ------------------------------------------------------------------
+  validate:
+    needs: resolve
+    if: needs.resolve.outputs.version != ''
+    runs-on: ubuntu-22.04
+    outputs:
+      status: ${{ steps.val.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖（解包 ISO / 造 rootfs）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq genisoimage e2fsprogs zip unzip
+          for t in isoinfo mkfs.ext4 e2fsck tar dpkg-deb; do
+            command -v "$t" >/dev/null || { echo "缺工具: $t"; exit 1; }
+          done
+
+      - name: 磁盘断言（ISO 头峰值约 20G）
+        run: |
+          avail=$(df --output=avail -BG "$RUNNER_TEMP" | tail -1 | tr -dc 0-9)
+          echo "可用磁盘: ${avail}G"
+          [ "$avail" -ge 25 ] || { echo "磁盘不足，中止"; exit 1; }
+
+      - name: 取证（字节级证据 + 出厂指纹；不写仓树）
+        id: val
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          ver="$VERSION"
+          sudo python3 .github/scripts/validate_patchset.py \
+            --repo "$GITHUB_WORKSPACE" --version "$ver" \
+            --out "$RUNNER_TEMP/evidence-$ver.json" \
+            --fingerprints "$RUNNER_TEMP/fingerprints-$ver.json" \
+            --workdir "$RUNNER_TEMP/rootfs"
+          rc=$?
+          if [ "$rc" = "3" ]; then
+            echo "status=unavailable" >> "$GITHUB_OUTPUT"
+            echo "::warning::无可用基材（ISO 与 deb-head 都不行）→ 记待基材，每日重试"
+            exit 0
+          fi
+          if [ "$rc" != "0" ]; then
+            echo "::error::取证失败 rc=$rc"
+            exit 1
+          fi
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: 记录待基材状态（无基材时）
+        if: steps.val.outputs.status == 'unavailable'
+        permissions:
+          contents: write
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VERSION"
+          mkdir -p state/pending
+          python3 - "$ver" <<'PY'
+          import datetime, json, os, sys
+          ver = sys.argv[1]
+          p = "state/pending/%s.json" % ver
+          old = {}
+          if os.path.isfile(p):
+              try: old = json.load(open(p))
+              except Exception: old = {}
+          data = {"version": ver,
+                  "missing": "rootfs 基材（官方 ISO 或可用的底座镜像）",
+                  "first_seen": old.get("first_seen") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "last_attempt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+          json.dump(data, open(p, "w"), ensure_ascii=False, indent=2)
+          PY
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/pending || true
+          git diff --cached --quiet || git commit -q -m "pending: $ver 缺基材，待重试"
+          git push origin HEAD:main
+
+      - name: 上传取证产物（只作 Release 资产，**不进仓树**）
+        if: steps.val.outputs.status == 'ok'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence
+          path: |
+            ${{ runner.temp }}/evidence-${{ needs.resolve.outputs.version }}.json
+            ${{ runner.temp }}/fingerprints-${{ needs.resolve.outputs.version }}.json
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  publish:
+    needs: [resolve, validate]
+    if: needs.resolve.outputs.version != '' && needs.validate.outputs.status == 'ok'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 解析声明（补丁集版本 / 发布 tag）
-        id: plan
-        run: |
-          ver="${{ inputs.patchset }}"
-          ver="${ver#V}"
-          tag="${{ inputs.release_tag }}"
-          [ -n "$tag" ] || tag="v${ver}"
-          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "VERSION=${ver}" >> "$GITHUB_ENV"
-          echo "TAG=${tag}" >> "$GITHUB_ENV"
-          echo "PLAN: patchset=$ver tag=$tag"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-evidence
+          path: ${{ runner.temp }}/evidence
 
-      - name: 校验就绪索引与补丁集自洽（发布前门禁）
-        id: verify
+      - name: 证据门（首发自动 / 修正人判）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          set -o pipefail
-          ps="toolchain/patches/fnos-${VERSION}.json"
+          set -euo pipefail
+          ver="$VERSION"; tag="$TAG"
+          ev="$RUNNER_TEMP/evidence/evidence-$ver.json"
+          [ -f "$ev" ] || { echo "::error::缺字节级证据，不发布"; exit 1; }
+          python3 - "$ev" "$ver" "$tag" <<'PY'
+          import json, os, sys
+          ev_path, ver, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+          ev = json.load(open(ev_path, encoding="utf-8"))
+          if ev.get("status") != "ready":
+              print("::error::字节级证据不是 ready（%s/%s 站命中）→ 不发布"
+                    % (ev.get("sites", {}).get("ready"), ev.get("sites", {}).get("total")))
+              sys.exit(1)
+          sha = ev.get("patchset_sha256")
+          print("字节级证据: %s 环境=%s 命中=%s/%s sha=%s"
+                % (ver, ev.get("environment", {}).get("source"),
+                   ev.get("sites", {}).get("ready"), ev.get("sites", {}).get("total"), sha))
+          # 判首发/修正：**目标发布 tag 的基名是否已存在**
+          base = "v%s" % ver
+          exists = False
+          for line in os.popen("git ls-remote --tags origin").read().splitlines():
+              if line.rstrip().endswith("refs/tags/%s" % base):
+                  exists = True
+          if not exists:
+              print("首发（%s 不存在）→ 字节级证据即足够" % base)
+              sys.exit(0)
+          # 修正：还要 intent + behavior 两份人工证据，且绑定同一 sha
+          missing = []
+          for kind in ("intent", "behavior"):
+              p = "toolchain/patches/evidence/fnos-%s.%s.json" % (ver, kind)
+              if not os.path.isfile(p):
+                  missing.append("%s 证据文件缺失" % kind); continue
+              d = json.load(open(p, encoding="utf-8"))
+              if d.get("patchset_sha256") != sha:
+                  missing.append("%s 证据绑定的 sha 与本次补丁集不符" % kind)
+          if missing:
+              print("::error::修正发布缺人工证据：%s → 不发布" % "；".join(missing))
+              sys.exit(1)
+          print("修正（%s 已存在）→ intent + behavior 证据齐全" % base)
+          PY
+
+      - name: 索引与补丁集自洽（发布前门禁）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VERSION"
+          ps="toolchain/patches/fnos-${ver}.json"
           idx="toolchain/patches/index.json"
           [ -f "$ps" ] || { echo "补丁集缺失: $ps"; exit 1; }
           [ -f "$idx" ] || { echo "索引缺失: $idx"; exit 1; }
-          # 索引必须是本 tag 内的那份（sync-public 生成，含全部版本），不重新生成
+          # 索引必须是仓里那份（同步阶段生成，含全部版本），不重新生成
           python3 toolchain/tests/validate-index.py --index "$idx"
-          idx_sha=$(python3 -c "import json;print(json.load(open('$idx'))['versions']['$VERSION']['sha256'])")
+          idx_sha=$(python3 -c "import json;print(json.load(open('$idx'))['versions']['$ver']['sha256'])")
           actual=$(sha256sum "$ps" | awk '{print $1}')
-          if [ "$idx_sha" != "$actual" ]; then
-            echo "索引 sha256 不一致: $idx_sha != $actual"; exit 1
-          fi
-          v_ready=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['ready'])")
-          v_total=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['total'])")
-          echo "补丁集自洽: ready=$v_ready/$v_total sha256=$actual"
+          [ "$idx_sha" = "$actual" ] || { echo "索引 sha256 不一致: $idx_sha != $actual"; exit 1; }
+          echo "索引与补丁集自洽: sha256=$actual"
 
-      - name: 幂等发布补丁集与索引到 Release（单 job 串行 clobber）
+      - name: 建 tag（唯一创建者；不可变 + fail-closed）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          set -o pipefail
-          ps="toolchain/patches/fnos-${VERSION}.json"
-          idx="toolchain/patches/index.json"
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "patchset $VERSION" --generate-notes
-          gh release upload "$TAG" "$ps" "$idx" --clobber
-          echo "已发布: $TAG"
+          set -euo pipefail
+          ver="$VERSION"; tag="$TAG"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 共享判定：0=可建/幂等，1=内容不符（拒绝），2=查询失败（fail-closed）
+          rc=0
+          bash toolchain/check-release-tag.sh --repo . --tag "$tag" \
+            --patchset-file "toolchain/patches/fnos-${ver}.json" || rc=$?
+          if [ "$rc" = "1" ]; then
+            echo "::error::既有 tag 内容与本次发布不符 → 拒绝（tag 不可变）"
+            exit 1
+          fi
+          if [ "$rc" = "2" ]; then
+            echo "::error::tag 存在性查询失败（fail-closed）→ 不创建、不覆盖"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "tag $tag 已存在且内容合规 → 幂等跳过（不移动）"
+          else
+            git tag "$tag" HEAD
+            git push origin "$tag"
+            echo "tag $tag 已创建并推送"
+          fi
+
+      - name: 发布 Release 资产（tag 与 Release 两个独立存在性检查）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="$VERSION"; tag="$TAG"
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "patchset $ver" --generate-notes
+          assets=("toolchain/patches/fnos-${ver}.json" "toolchain/patches/index.json")
+          [ -f "$RUNNER_TEMP/evidence/evidence-${ver}.json" ] && assets+=("$RUNNER_TEMP/evidence/evidence-${ver}.json")
+          [ -f "$RUNNER_TEMP/evidence/fingerprints-${ver}.json" ] && assets+=("$RUNNER_TEMP/evidence/fingerprints-${ver}.json")
+          gh release upload "$tag" "${assets[@]}" --clobber
+          echo "已发布: $tag"
 
       - name: 归档发布产物
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ steps.plan.outputs.tag }}
+          name: release-${{ needs.resolve.outputs.tag }}
           path: |
-            toolchain/patches/fnos-${{ steps.plan.outputs.ver }}.json
+            toolchain/patches/fnos-${{ needs.resolve.outputs.version }}.json
             toolchain/patches/index.json
           if-no-files-found: warn
