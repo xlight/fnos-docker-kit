@@ -1,14 +1,35 @@
 #!/usr/bin/env python3
-# 从公开仓下载当前运行版本缺失的补丁集：读索引 → 下载 → sha256 → 结构校验 → 原子安装。
+# fnos-patchset-fetch —— 下载/更新当前运行版本的补丁集。
+#
+# 读索引 → 选候选（精确优先，否则覆盖度最高的严格更早版本）→ 按 source_commit
+# 固定下载 → sha256 → 结构校验 → 原子安装 → 写旁注（索引 revision）。
 # 失败一律 exit 0（开机不被阻塞），原因写 stderr/journal。
-import hashlib, json, os, re, ssl, sys, tempfile, urllib.request
+#
+# 语义（design D6/D12）：
+#   * 精确版本优先；没有精确命中时接受**严格更早**的候选（按覆盖度最高、版本最近
+#     排序），并记录未覆盖部分；**拒绝**更高版本与预发布后缀。
+#   * 索引条目带 source_commit 时按该提交固定下载（读索引与读补丁集必是同一 revision）。
+#   * 旧索引（无 samples/coverage/source_commit）按"精确版本命中"解释，行为不变。
+#   * 已安装的补丁集也会复查索引：条目被 revoked、或索引 revision 高于安装时记录的
+#     revision → 重新下载替换；旧文件改名隔离（.revoked-<ts>），**永不删除**。
+import hashlib
+import json
+import os
+import re
+import shutil
+import ssl
+import sys
+import tempfile
+import time
+import urllib.request
 
-D = "/usr/local/share/fnos-toolchain"
-PATCHES = D + "/patches"
-VER_PATH = "/usr/trim/etc/version"
+D = os.environ.get("FNOS_TOOLCHAIN_DIR", "/usr/local/share/fnos-toolchain")
+PATCHES = os.environ.get("FNOS_PATCHES_DIR", D + "/patches")
+VER_PATH = os.environ.get("FNOS_VERSION_PATH", "/usr/trim/etc/version")
 INDEX_URL = os.environ.get(
     "FNOS_INDEX_URL",
     "https://raw.githubusercontent.com/xlight/fnos-docker-kit/main/toolchain/patches/index.json")
+RAW_RE = re.compile(r"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$")
 
 
 def log(msg):
@@ -22,62 +43,226 @@ def fetch(url, timeout=20):
         return r.read()
 
 
+def vkey(v):
+    try:
+        return tuple(int(x) for x in re.findall(r"\d+", str(v)))
+    except Exception:
+        return (0,)
+
+
+def is_prerelease(v):
+    """带修订/预发布后缀的版本（如 1.2.1010-r2、1.2.1010-rc1）不作候选。"""
+    return bool(re.search(r"[-+]", str(v)))
+
+
+def raw_parts(index_url):
+    """从索引 URL 解析 (owner, repo, ref, path_prefix)；非 raw.githubusercontent 则 None。"""
+    m = RAW_RE.match(index_url)
+    if not m:
+        return None
+    owner, repo, ref, path = m.groups()
+    return owner, repo, ref, path.rsplit("/", 1)[0]
+
+
+def coverage_of(idx, patchset_ver, target_ver):
+    """覆盖度单元格（无矩阵 → None，按旧语义走）。"""
+    cov = (idx.get("coverage") or {}).get(patchset_ver) or {}
+    return cov.get(target_ver)
+
+
+def select_candidate(rv, idx):
+    """选补丁集候选：精确优先，否则覆盖度最高的严格更早版本。
+
+    返回 (ver, entry, coverage_cell) 或 None。
+    """
+    versions = idx.get("versions") or {}
+    exact = versions.get(rv)
+    if exact:
+        return rv, exact, coverage_of(idx, rv, rv)
+    tk = vkey(rv)
+    cands = []
+    for ver, e in versions.items():
+        if ver == rv or is_prerelease(ver):
+            continue
+        vk = vkey(ver)
+        if not vk or vk >= tk:          # 拒绝更高版本
+            continue
+        cell = coverage_of(idx, ver, rv)
+        covered = (cell or {}).get("covered_files")
+        total = (cell or {}).get("total_files")
+        # 覆盖度优先（缺覆盖度的候选排后）、版本最近次之
+        cov_key = (-1 if covered is None else covered, -1 if total is None else total)
+        cands.append((cov_key, vk, ver, e, cell))
+    if not cands:
+        return None
+    cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    cov_key, vk, ver, e, cell = cands[0]
+    return ver, e, cell
+
+
+def local_index_revision_path(ver):
+    return os.path.join(PATCHES, ".fnos-%s.index-revision" % ver)
+
+
+def read_installed_revision(ver):
+    p = local_index_revision_path(ver)
+    try:
+        return int(open(p, encoding="utf-8").read().strip())
+    except Exception:
+        return None
+
+
+def write_installed_revision(ver, revision):
+    p = local_index_revision_path(ver)
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("%s\n" % revision)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except OSError as e:
+        log("cannot write revision sidecar: %s" % e)
+
+
+def needs_refresh(ver, entry, idx):
+    """已安装的补丁集是否需要重新下载。
+
+    - 条目被撤销（revoked）→ 需要
+    - 索引 revision 高于安装时记录的 revision → 需要
+    - 否则不需要（旧文件保留）
+    """
+    if not entry:
+        return False
+    if entry.get("revoked"):
+        return True
+    installed = read_installed_revision(ver)
+    cur = idx.get("revision")
+    if installed is None or cur is None:
+        return False
+    try:
+        return int(cur) > int(installed)
+    except Exception:
+        return False
+
+
+def download(entry, name, index_url):
+    """按 source_commit 固定下载（没有则用索引 URL 的 ref）。"""
+    parts = raw_parts(index_url)
+    url = "%s/%s" % (index_url.rsplit("/", 1)[0], name)
+    if parts and entry.get("source_commit"):
+        owner, repo, _ref, prefix = parts
+        url = "https://raw.githubusercontent.com/%s/%s/%s/%s/%s" % (
+            owner, repo, entry["source_commit"], prefix, name)
+    raw = fetch(url)
+    return raw, url
+
+
+def validate_structure(ps, expect_version):
+    ids = [p.get("id") for p in ps.get("patches") or []]
+    if (not ids or len(ids) != len(set(ids)) or not ps.get("file_hashes")):
+        return False
+    # 版本锚：精确匹配；候选（严格更早）允许锚不同，但不得是更高版本
+    got = str(ps.get("fnos_version", "")).lstrip("Vv")
+    if got != expect_version:
+        if vkey(got) > vkey(expect_version) or is_prerelease(got):
+            return False
+    return True
+
+
+def install(raw, name):
+    """原子安装（临时文件 + fsync + os.replace）。"""
+    fd, tmp = tempfile.mkstemp(dir=PATCHES, prefix=".fetch-")
+    with os.fdopen(fd, "wb") as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, os.path.join(PATCHES, name))
+
+
+def quarantine(path):
+    """旧文件隔离：改名 .revoked-<ts>（**永不删除**，保留可追溯）。"""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = "%s.revoked-%s" % (path, ts)
+    try:
+        os.rename(path, dst)
+        return dst
+    except OSError as e:
+        log("quarantine failed: %s" % e)
+        return None
+
+
 def main():
     try:
-        rv = open(VER_PATH).read().strip().lstrip("Vv")
+        rv = open(VER_PATH, encoding="utf-8").read().strip().lstrip("Vv")
     except OSError:
         log("cannot read %s" % VER_PATH)
         return 0
     if not rv:
         log("empty version")
         return 0
-    if os.path.exists(os.path.join(PATCHES, "fnos-%s.json" % rv)):
-        log("patchset for %s already present" % rv)
-        return 0
     try:
         idx = json.loads(fetch(INDEX_URL).decode("utf-8"))
     except Exception as e:
         log("index fetch failed: %s" % e)
         return 0
-    e = (idx.get("versions") or {}).get(rv)
-    if not e:
-        log("no index entry for %s (readiness missing)" % rv)
+
+    cand = select_candidate(rv, idx)
+    if not cand:
+        log("no usable patchset for %s (readiness missing)" % rv)
         return 0
-    name = e.get("patchset")
-    want_sha = e.get("sha256")
-    base = INDEX_URL.rsplit("/", 1)[0]
+    cver, entry, cell = cand
+    name = entry.get("patchset")
+    want_sha = entry.get("sha256")
+    if not name or not want_sha:
+        log("index entry for %s incomplete" % cver)
+        return 0
+
+    local_path = os.path.join(PATCHES, name)
+    have_local = os.path.exists(local_path)
+    if have_local and not needs_refresh(cver, entry, idx):
+        log("patchset for %s already present and current" % rv)
+        return 0
+
     try:
-        raw = fetch("%s/%s" % (base, name))
+        raw, url = download(entry, name, INDEX_URL)
     except Exception as ex:
         log("patchset download failed: %s" % ex)
+        if have_local:
+            log("keeping installed patchset (download failed)")
         return 0
     if hashlib.sha256(raw).hexdigest() != want_sha:
         log("sha256 mismatch for %s, discarded" % name)
+        if have_local:
+            log("keeping installed patchset (checksum mismatch)")
         return 0
     try:
         ps = json.loads(raw)
     except Exception:
         log("downloaded patchset is not JSON, discarded")
         return 0
-    # 结构校验：版本匹配、patches 非空、id 唯一、file_hashes 存在（不做二进制预验证——目标二进制尚未安装）
-    ids = [p.get("id") for p in ps.get("patches") or []]
-    if (str(ps.get("fnos_version", "")).lstrip("Vv") != rv or not ids
-            or len(ids) != len(set(ids)) or not ps.get("file_hashes")):
+    if not validate_structure(ps, cver):
         log("structural validation failed for %s, discarded" % name)
+        if have_local:
+            log("keeping installed patchset (structure invalid)")
         return 0
-    dst = os.path.join(PATCHES, name)
-    fd, tmp = tempfile.mkstemp(dir=PATCHES, prefix=".fetch-")
-    with os.fdopen(fd, "wb") as f:
-        f.write(raw)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, dst)
-    dfd = os.open(PATCHES, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
-    log("installed %s (sha256 ok, %d patches)" % (name, len(ids)))
+
+    if have_local:
+        q = quarantine(local_path)
+        if q:
+            log("quarantined previous %s -> %s" % (name, os.path.basename(q)))
+    install(raw, name)
+    write_installed_revision(cver, idx.get("revision", 0))
+    ids = len(ps.get("patches") or [])
+    log("installed %s (sha256 ok, %d patches) from %s" % (name, ids, url))
+    if cver != rv:
+        log("candidate %s is older than running %s (fallback)" % (cver, rv))
+        missing = (cell or {}).get("missing") or []
+        if missing:
+            log("uncovered files: %s" % ", ".join(missing[:5]))
+    if entry.get("revoked"):
+        log("note: index marks %s as revoked (superseded_by=%s)" % (
+            cver, entry.get("superseded_by")))
     return 0
 
 

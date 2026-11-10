@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# ============================================================================
+# publish.sh —— 声明式发布命令（design D3/D8/D9）
+#
+#   publish.sh --patchset <ver> [--image <ver>] [--release-tag <tag>]
+#              [--dry-run] [--repo <公开仓工作区>]
+#
+# 做什么：
+#   1) 8 项预检（任何一项不过 → 非零退出，**远端零副作用**）
+#   2) 两段提交：commit#1 = 内容，commit#2 = 带 source_commit 的就绪索引
+#   3) 发布 tag 不可变（已存在且合规 → 幂等跳过；不合规 → 报错拒绝）
+#   4) 主分支与 tag 一次原子推送（要么都生效，要么都不生效）
+#   5) 可选 --image <ver>：发布成功后 dispatch 一次镜像构建（不等待、不回滚）
+#
+# 公开可复现：本脚本与 sync-public.sh、public-manifest.txt 一起进公开仓。
+# 脚本内**不得**硬编码宿主私有绝对路径（一律 $HOME 或参数）。
+# ============================================================================
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PATCHSET_VER=""
+IMAGE_VER=""
+RELEASE_TAG=""
+PUB_REPO="${FNOS_PUBLIC_REPO:-$HOME/fnos-docker-kit}"
+DRY_RUN=0
+
+log()  { printf '[publish] %s\n' "$*"; }
+ok()   { printf '[publish]   PASS  %s\n' "$*"; }
+bad()  { printf '[publish]   FAIL  %s\n' "$*"; }
+die()  { printf '[publish] FATAL: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --patchset)    PATCHSET_VER="${2:-}"; shift 2;;
+    --image)       IMAGE_VER="${2:-}"; shift 2;;
+    --release-tag) RELEASE_TAG="${2:-}"; shift 2;;
+    --repo)        PUB_REPO="${2:-}"; shift 2;;
+    --dry-run)     DRY_RUN=1; shift;;
+    -h|--help)     usage;;
+    *) die "未知参数: $1（--help 看用法）";;
+  esac
+done
+[ -n "$PATCHSET_VER" ] || { usage; }
+PATCHSET_VER="${PATCHSET_VER#V}"
+[ -n "$RELEASE_TAG" ] || RELEASE_TAG="v${PATCHSET_VER}"
+
+PRIVATE_PS="$SCRIPT_DIR/patches/fnos-${PATCHSET_VER}.json"
+REHEARSE_REC="${FNOS_REHEARSE_DIR:-$HOME/fnos/backups/rehearsal}/fnos-${PATCHSET_VER}.json"
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+
+FAILED=0
+precheck() { # <名称> <说明>；返回 0=通过
+  if "$@"; then ok "$PRECHECK_NAME"; return 0; fi
+  bad "$PRECHECK_NAME —— $PRECHECK_DESC"
+  FAILED=1
+  return 1
+}
+
+# ---------- 预检 1：补丁集存在 + validation 自洽 ----------
+PRECHECK_NAME="[1] 补丁集存在且 validation 自洽"
+PRECHECK_DESC="缺 $PRIVATE_PS 或 validation 字段不自洽"
+p1() {
+  [ -f "$PRIVATE_PS" ] || return 1
+  python3 - "$PRIVATE_PS" <<'PY' >/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = d.get("validation") or {}
+assert v.get("total") and v.get("ready") is not None
+assert d.get("fnos_version"), "fnos_version 缺失"
+PY
+}
+precheck p1
+
+# ---------- 预检 2：公开集包含构建所需文件（组装一次供后续检查用） ----------
+PRECHECK_NAME="[2] 公开集包含构建依赖集合"
+PRECHECK_DESC="公开集缺构建依赖（sync-public.sh 会列出缺哪个）"
+p2() { INDEX_BASE_FILE="$PUB_REPO/toolchain/patches/index.json" bash "$SCRIPT_DIR/sync-public.sh" stage-noidx "$STAGE" >/dev/null 2>"$STAGE/.stage-err"; }
+if precheck p2; then
+  [ -s "$STAGE/.stage-err" ] && tail -3 "$STAGE/.stage-err"
+else
+  tail -5 "$STAGE/.stage-err" 2>/dev/null
+fi
+
+# ---------- 预检 3：本地 rehearsal 有效 ----------
+PRECHECK_NAME="[3] 本地演练记录有效且与本次补丁集一致"
+PRECHECK_DESC="缺 $REHEARSE_REC，或 result != ok，或补丁集 sha256 与记录不符"
+p3() {
+  [ -f "$REHEARSE_REC" ] || return 1
+  python3 - "$REHEARSE_REC" "$PRIVATE_PS" <<'PY' >/dev/null
+import hashlib, json, sys
+rec = json.load(open(sys.argv[1]))
+ps = sys.argv[2]
+assert rec.get("result") == "ok", "rehearsal result != ok"
+want = rec.get("patchset_sha256")
+got = hashlib.sha256(open(ps, "rb").read()).hexdigest()
+assert want == got, "补丁集 sha256 与演练记录不符（rebase 后需重跑演练）"
+PY
+}
+precheck p3
+
+# ---------- 预检 4：目标 tag 不存在，或已存在且内容合规 ----------
+PRECHECK_NAME="[4] 目标 tag 不存在或已存在且内容合规"
+PRECHECK_DESC="tag $RELEASE_TAG 已存在但内容与本次发布不符（tag 不可变）"
+p4() {
+  git -C "$PUB_REPO" rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null || return 0
+  # 已存在：校验其补丁集哈希是否等于本次（脱敏后）补丁集哈希
+  local want got
+  want=$(sha256sum "$STAGE/toolchain/patches/fnos-${PATCHSET_VER}.json" 2>/dev/null | awk '{print $1}')
+  got=$(git -C "$PUB_REPO" show "$RELEASE_TAG:toolchain/patches/fnos-${PATCHSET_VER}.json" 2>/dev/null | sha256sum | awk '{print $1}')
+  [ -n "$want" ] && [ "$want" = "$got" ]
+}
+precheck p4
+
+# ---------- 预检 5：索引条目 sha256 == 补丁集实际哈希（脱敏后形态） ----------
+PRECHECK_NAME="[5] 就绪索引与补丁集哈希一致"
+PRECHECK_DESC="索引生成后会与脱敏后补丁集不一致（同步阶段会再校验一次）"
+p5() {
+  INDEX_BASE_FILE="$PUB_REPO/toolchain/patches/index.json" \
+  INDEX_SOURCE_COMMIT="" \
+    bash "$SCRIPT_DIR/sync-public.sh" gen-index "$STAGE" >/dev/null 2>&1 || return 1
+  python3 - "$STAGE/toolchain/patches/index.json" "$STAGE/toolchain/patches/fnos-${PATCHSET_VER}.json" <<'PY' >/dev/null
+import hashlib, json, sys
+idx = json.load(open(sys.argv[1]))
+raw = open(sys.argv[2], "rb").read()
+e = idx["versions"][sys.argv[2].split("fnos-")[1].split(".json")[0]]
+assert e["sha256"] == hashlib.sha256(raw).hexdigest(), "索引 sha256 与补丁集实际哈希不符"
+PY
+}
+precheck p5
+
+# ---------- 预检 6：git 身份 / 写权限 / 远端可达 / 工作树干净 ----------
+PRECHECK_NAME="[6] git 身份、写权限、远端可达、工作树干净"
+PRECHECK_DESC="git 配置缺失、目录不可写、远端不可达或工作树有未提交改动"
+p6() {
+  [ -d "$PUB_REPO/.git" ] || return 1
+  git -C "$PUB_REPO" config user.name >/dev/null 2>&1 || return 1
+  git -C "$PUB_REPO" config user.email >/dev/null 2>&1 || return 1
+  [ -w "$PUB_REPO" ] || return 1
+  # 远端可达（不要求 HEAD 指向某个分支：裸仓的 HEAD 可能仍指向不存在的 master）
+  git -C "$PUB_REPO" ls-remote origin >/dev/null 2>&1 || return 1
+  [ -z "$(git -C "$PUB_REPO" status --porcelain)" ] || return 1
+}
+precheck p6
+
+# ---------- 预检 7：声明版本与 release tag 一致 ----------
+PRECHECK_NAME="[7] 声明版本与 release tag 一致"
+PRECHECK_DESC="tag $RELEASE_TAG 与 --patchset $PATCHSET_VER 不属于同一版本"
+p7() {
+  case "$RELEASE_TAG" in
+    "v${PATCHSET_VER}"|"v${PATCHSET_VER}-r"*) return 0;;
+  esac
+  return 1
+}
+precheck p7
+
+# ---------- 预检 8：新索引 revision == 公开仓当前 revision + 1 ----------
+PRECHECK_NAME="[8] 新索引 revision 只前进一格"
+PRECHECK_DESC="新索引 revision 不是公开仓当前 revision + 1（防回退/跳号）"
+p8() {
+  local cur new
+  cur=$(python3 - "$PUB_REPO/toolchain/patches/index.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["revision"])
+except Exception:
+    print(0)
+PY
+)
+  new=$(python3 - "$STAGE/toolchain/patches/index.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    print(json.load(open(sys.argv[1]))["revision"])
+except Exception:
+    print(0)
+PY
+)
+  [ -n "$cur" ] && [ -n "$new" ] && [ "$new" = "$((cur + 1))" ]
+}
+precheck p8
+
+if [ "$FAILED" != 0 ]; then
+  die "预检未通过（$FAILED 项），中止（远端零副作用）"
+fi
+log "8 项预检全部通过"
+
+if [ "$DRY_RUN" = "1" ]; then
+  log "DRY-RUN：到此为止（不提交、不打 tag、不推送、不触发构建）"
+  log "计划：patchset=$PATCHSET_VER tag=$RELEASE_TAG image=${IMAGE_VER:-<无>}"
+  exit 0
+fi
+
+# ================= 执行 =================
+log "拉平基线（与 CI 的 state 提交并发时先 rebase）"
+git -C "$PUB_REPO" pull --rebase --autostash origin main || die "pull --rebase 失败"
+
+log "组装公开内容（两段提交的第一段：内容，不含索引）"
+# 旧索引先留档：它既是新 revision 的基线（公开仓为准），也要留到第二段再生成
+if [ -f "$PUB_REPO/toolchain/patches/index.json" ]; then
+  cp "$PUB_REPO/toolchain/patches/index.json" "$STAGE/index-base.json"
+fi
+preserve_tmp="$(mktemp -d)"
+while IFS= read -r rel; do
+  [ -n "$rel" ] || continue
+  if [ -e "$PUB_REPO/$rel" ]; then
+    mkdir -p "$preserve_tmp/$(dirname "$rel")"
+    cp -a "$PUB_REPO/$rel" "$preserve_tmp/$rel"
+  fi
+done < <(bash "$SCRIPT_DIR/sync-public.sh" preserve-list 2>/dev/null)
+(cd "$PUB_REPO" && git ls-files -z | xargs -0 -r rm -f; find . -path ./.git -prune -o -type d -empty -delete)
+cp -a "$STAGE/." "$PUB_REPO/"
+if [ -n "$(ls -A "$preserve_tmp" 2>/dev/null)" ]; then
+  (cd "$preserve_tmp" && find . -type f -print0) | while IFS= read -r -d "" f; do
+    mkdir -p "$PUB_REPO/$(dirname "$f")"
+    cp -a "$preserve_tmp/$f" "$PUB_REPO/$f"
+  done
+fi
+rm -rf "$preserve_tmp"
+# 索引挪到第二段提交
+mkdir -p "$PUB_REPO/toolchain/patches"
+mv "$PUB_REPO/toolchain/patches/index.json" "$STAGE/index.json.pending" 2>/dev/null || true
+
+git -C "$PUB_REPO" add -A
+git -C "$PUB_REPO" commit -q -m "publish: 内容 $(date -u +%Y%m%dT%H%M%SZ)" || die "commit#1 失败"
+COMMIT1="$(git -C "$PUB_REPO" rev-parse HEAD)"
+log "commit#1 = $COMMIT1"
+
+log "生成索引（source_commit = commit#1）"
+mkdir -p "$PUB_REPO/toolchain/patches"
+INDEX_BASE_FILE="$STAGE/index-base.json" \
+INDEX_SOURCE_COMMIT="$COMMIT1" \
+  bash "$SCRIPT_DIR/sync-public.sh" gen-index "$PUB_REPO" >/dev/null || die "索引生成失败"
+git -C "$PUB_REPO" add toolchain/patches/index.json
+git -C "$PUB_REPO" commit -q -m "publish: 索引 revision+1 (source_commit=$COMMIT1)" || die "commit#2 失败"
+COMMIT2="$(git -C "$PUB_REPO" rev-parse HEAD)"
+log "commit#2 = $COMMIT2"
+
+if git -C "$PUB_REPO" rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+  log "tag $RELEASE_TAG 已存在且内容合规 → 幂等跳过（不移动 tag）"
+else
+  git -C "$PUB_REPO" tag "$RELEASE_TAG" "$COMMIT2" || die "打 tag 失败"
+fi
+
+log "原子推送（main + tag 一起生效）"
+git -C "$PUB_REPO" push --atomic origin main "$RELEASE_TAG" || die "原子推送失败（远端保持原状）"
+
+# 审计链
+if [ -f "$REPO_ROOT/scripts/lib.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/scripts/lib.sh" >/dev/null 2>&1 || true
+  if command -v manifest_add >/dev/null 2>&1; then
+    manifest_add "$(python3 -c 'import json,sys; print(json.dumps({"mech":"release","action":"publish","version":sys.argv[1],"tag":sys.argv[2]},ensure_ascii=False))' "$PATCHSET_VER" "$RELEASE_TAG")" || true
+  fi
+fi
+
+if [ -n "$IMAGE_VER" ]; then
+  log "触发镜像构建（显式声明；不等待、失败不回滚发布）"
+  pub_repo_slug="$(git -C "$PUB_REPO" remote get-url origin 2>/dev/null \
+    | sed -E 's#^https?://[^/]+/##; s#^git@[^:]+:##; s#\.git$##')"
+  gh workflow run public-ci.yml -R "${pub_repo_slug:-xlight/fnos-docker-kit}" \
+     -f version="$IMAGE_VER" -f channel=iso \
+    || log "WARN: 镜像构建 dispatch 失败（发布已完成，可手工重跑）"
+fi
+
+log "发布完成：patchset=$PATCHSET_VER tag=$RELEASE_TAG"

@@ -1,0 +1,77 @@
+# 公开 CI 观察单元（daily）：只发现新版 + 维护 Issue，**不构建、不推镜像**
+# 设计来源：streamline-public-release-flow D1（观察/构建/发布三单元）、D10（issue 生命周期）
+#
+# 职责：
+#   1. 双通道检测（下载页 + OTA 清单），各通道在**自己的成功点**写 state/
+#      （state/page_ver、state/ota_ver；由 CI 提交，Hub tag 仍是最终事实）；
+#   2. 按（版本, 通道）维护一条 Issue：
+#        待 rebase: <ver> (<channel>)   公开仓缺该版本补丁集
+#        可构建:   <ver> (<channel>)   补丁集已就绪、镜像还没发
+#      状态未变不动它；被误关自动重开；镜像出现后自动关闭。
+#   3. **不触发任何构建**：构建只由显式声明触发（publish.sh --image 或手工 dispatch）。
+name: public-watch
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write   # 提交 state/（Actions cache 不可更新，不能当状态载体）
+      issues: write     # 维护版本状态 Issue
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 双通道检测（各通道独立写 state）
+        id: detect
+        run: |
+          set +e
+          python3 toolchain/check-iso-update.py \
+            --state state/page_ver --ota-state state/ota_ver --no-probe > /tmp/detect.json
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat /tmp/detect.json
+          case "$rc" in
+            0)  echo "无变化" ;;
+            10|11) echo "检测到新版本（11=裸 URL 被拦，签名 URL 仍可用）" ;;
+            2)  echo "::warning::检测器有通道失败（已成功通道的 state 不受影响）" ;;
+            *)  echo "::error::检测器返回意外 rc=$rc"; exit 1 ;;
+          esac
+
+      - name: 提交 state（版本记录；不含任何镜像/补丁集内容）
+        run: |
+          if git diff --quiet -- state/ && git diff --cached --quiet -- state/; then
+            echo "state 无变化，不提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/
+          git commit -m "watch: state $(date -u +%Y%m%dT%H%M%SZ)" || { echo "无待提交内容"; exit 0; }
+          git push || echo "::warning::state 推送失败（下次运行会重试；Hub tag 仍是最终事实）"
+
+      - name: 维护 Issue 生命周期（待 rebase / 可构建 / 自动关闭）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKERHUB_REPO: xlight/fnos-dockermode
+        run: |
+          python3 .github/scripts/watch-issue.py \
+            --detect /tmp/detect.json \
+            --index toolchain/patches/index.json \
+            --repo "${{ github.repository }}" \
+            --hub-repo "${DOCKERHUB_REPO}"
+
+      - name: 归档检测产物（便于排查）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-detect
+          path: /tmp/detect.json
+          if-no-files-found: warn

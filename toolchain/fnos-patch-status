@@ -417,6 +417,31 @@ def pending_target():
     return target, vers[target]
 
 
+def coverage_gap(idx, target_ver):
+    """目标版本的覆盖缺口（参考级提示）：最多 5 条 + "…等 M 项"。
+
+    只在索引带覆盖度矩阵时给出；无矩阵返回 None（不编造覆盖数字）。
+    """
+    if not idx:
+        return None
+    cov = idx.get("coverage") or {}
+    cell = None
+    for pver, targets in cov.items():
+        c = (targets or {}).get(str(target_ver))
+        if not c:
+            continue
+        if cell is None or (c.get("covered_files") or 0) > (cell.get("covered_files") or 0):
+            cell = c
+    if not cell:
+        return None
+    missing = list(cell.get("missing") or [])
+    if not missing:
+        return []
+    names = missing[:5]
+    more = len(missing) - len(names)
+    return names + (["…等 %d 项" % more] if more > 0 else [])
+
+
 def _sql_str(s):
     return s.replace("'", "''")
 
@@ -487,7 +512,11 @@ def notify_postgres(issues, warnings, all_healthy):
                 body = "补丁集 %s 部分就绪（%s/%s）；未命中项升级后会被跳过并记录。" % (ver, ready, total)
             else:
                 body = "补丁集 %s 尚未就绪；升级后部分补丁可能不可用。" % ver
-            _upsert_notify(SRC_READY, 0, "补丁集就绪状态", body)
+            # 覆盖缺口（**参考级**提示）：只补充信息，不抑制升级提示
+            gap = coverage_gap(read_proxy_index(), ver)
+            if gap:
+                body += "（参考：未覆盖 %s）" % "、".join(gap)
+            _upsert_notify(SRC_READY, 0, "补丁集就绪状态", _truncate(body, 2048))
         return True
     except Exception as e:
         sys.stderr.write("notify_postgres failed: %s\n" % str(e))

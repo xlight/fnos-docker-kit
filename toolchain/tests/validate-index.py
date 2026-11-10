@@ -11,7 +11,7 @@
 用法: python3 fnos/toolchain/tests/validate-index.py [--index <path>] [--patches-dir <dir>]
 退出码: 0 全部通过；1 任一不符。
 """
-import argparse, hashlib, json, os, sys
+import argparse, hashlib, json, os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TC = os.path.dirname(HERE)
@@ -70,11 +70,68 @@ def main():
                 errs.append("%s: status %r but validation implies %r" % (ver, e.get("status"), want))
             if e.get("validated_at") != val.get("validated_at"):
                 errs.append("%s: validated_at mismatch" % ver)
+    # ---- 新字段按 revision 门控（revision >= 16 或含 samples 才强制）----
+    # 旧索引（revision 15 及更早）重放时不得因新字段缺失而失败。
+    # 门控起点 = 19：已发布的 v1.2.1010(rev 15) 与 v1.2.1010-r2(rev 18) 必须仍可重放，
+    # 所以新字段（source_commit / samples / coverage）从**下一个** revision 起强制。
+    GATED_REVISION = 19
+    gated = (isinstance(rev, int) and rev >= GATED_REVISION) or ("samples" in idx)
+    if gated:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "index_builder", os.path.join(TC, "index_builder.py"))
+        ib = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(ib)
+        except Exception as e:
+            errs.append("cannot load index_builder.py: %s" % e)
+            ib = None
+        # 索引键必须是裸 fnOS 版本（修订号只出现在 tag 上）
+        for ver in versions:
+            if re.search(r"-r\d+$", ver):
+                errs.append("index key must be bare fnOS version, got %r" % ver)
+        # 条目携带 source_commit
+        for ver, e in versions.items():
+            if not e.get("source_commit"):
+                errs.append("%s: missing source_commit (revision>=%d 要求)" % (ver, GATED_REVISION))
+        samples = idx.get("samples") or {}
+        for ver, s in samples.items():
+            if s.get("source") not in ("tier-A", "tier-B"):
+                errs.append("%s: bad sample source %r" % (ver, s.get("source")))
+            if s.get("state") not in ("factory", "patched"):
+                errs.append("%s: bad sample state %r" % (ver, s.get("state")))
+            if s.get("source") == "tier-B":
+                errs.append("%s: tier-B sample must not be published in the public index" % ver)
+        cov = idx.get("coverage") or {}
+        if ib is not None:
+            for pver, targets in cov.items():
+                pe = versions.get(pver)
+                if not pe:
+                    errs.append("coverage: unknown patchset version %r" % pver)
+                    continue
+                ps = json.load(open(os.path.join(a.patches_dir, pe["patchset"]), encoding="utf-8"))
+                fh = ps.get("file_hashes") or {}
+                for tver, cell in (targets or {}).items():
+                    smp = samples.get(tver)
+                    if not smp:
+                        errs.append("coverage[%s][%s]: no sample for target" % (pver, tver))
+                        continue
+                    want = ib.coverage_for(fh, smp.get("files") or {})
+                    for k in ("covered_files", "total_files", "status"):
+                        if cell.get(k) != want.get(k):
+                            errs.append("coverage[%s][%s].%s = %r, recomputed %r" % (
+                                pver, tver, k, cell.get(k), want.get(k)))
+                    if list(cell.get("missing") or []) != list(want.get("missing") or []):
+                        errs.append("coverage[%s][%s].missing mismatch: %r vs %r" % (
+                            pver, tver, cell.get("missing"), want.get("missing")))
     if errs:
         for e in errs:
             print("FAIL:", e, file=sys.stderr)
         return 1
-    print("index OK: revision=%s versions=%s" % (rev, ",".join(sorted(versions))))
+    print("index OK: revision=%s versions=%s%s" % (
+        rev, ",".join(sorted(versions)),
+        (" samples=%s coverage=%s" % (",".join(sorted(idx.get("samples") or {})),
+                                      ",".join(sorted(idx.get("coverage") or {})))) if gated else ""))
     return 0
 
 

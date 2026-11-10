@@ -119,23 +119,75 @@ def fetch_index():
                 return None, "unknown"
 
 
+def vkey(v):
+    m = re.match(r"\s*(\d+(?:\.\d+)*)", str(v))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (0,)
+
+
 def readiness_for(version):
-    """返回 (state, ready, total, source)。state: ready/partial/missing/unknown。"""
+    """返回 (state, ready, total, source, detail)。
+
+    state: ready/partial/missing/unknown
+    detail: {"patchset_ver":..., "missing":[...], "covered":..., "total_files":...}
+
+    有覆盖度矩阵时，按 (目标版本, 候选补丁集) 回答：精确版本优先，否则取覆盖度最高
+    的严格更早候选；部分覆盖时 detail["missing"] 点名未覆盖文件。无矩阵（旧索引）
+    时退化为精确版本语义，行为与改造前一致。
+    """
     data, src = fetch_index()
     if data is None:
-        return "unknown", None, None, src
-    e = (data.get("versions") or {}).get(str(version))
-    if not e:
-        return "missing", None, None, src
-    return str(e.get("status") or "missing"), e.get("ready"), e.get("total"), src
+        return "unknown", None, None, src, {}
+    versions = data.get("versions") or {}
+    e = versions.get(str(version))
+    if e:
+        detail = {}
+        cov = ((data.get("coverage") or {}).get(str(version)) or {}).get(str(version))
+        if cov:
+            detail = {"patchset_ver": str(version), "missing": cov.get("missing") or [],
+                      "covered": cov.get("covered_files"), "total_files": cov.get("total_files")}
+        return str(e.get("status") or "missing"), e.get("ready"), e.get("total"), src, detail
+    # 无精确命中：按覆盖度挑更早候选（仅当矩阵存在）
+    cov_all = data.get("coverage") or {}
+    tk = vkey(version)
+    best = None
+    for pver, targets in cov_all.items():
+        cell = (targets or {}).get(str(version))
+        if not cell:
+            continue
+        if vkey(pver) >= tk:
+            continue
+        key = (cell.get("covered_files") or 0, vkey(pver))
+        if best is None or key > best[0]:
+            best = (key, pver, cell)
+    if best:
+        _key, pver, cell = best
+        pe = versions.get(pver) or {}
+        detail = {"patchset_ver": pver, "missing": cell.get("missing") or [],
+                  "covered": cell.get("covered_files"), "total_files": cell.get("total_files")}
+        state = "ready" if not cell.get("missing") else "partial"
+        return state, pe.get("ready"), pe.get("total"), src, detail
+    return "missing", None, None, src, {}
 
 
 def status_line(version):
-    state, ready, total, src = readiness_for(version)
+    state, ready, total, src, detail = readiness_for(version)
+    gap = ""
+    if detail.get("missing"):
+        names = list(detail["missing"])[:5]
+        more = len(detail["missing"]) - len(names)
+        gap = "未覆盖：%s%s" % ("、".join(names), ("…等 %d 项" % more) if more > 0 else "")
     if state == "ready":
-        return "补丁集 %s 已就绪（%s/%s），升级后会自动重新应用。" % (version, ready, total)
+        line = "补丁集 %s 已就绪（%s/%s），升级后会自动重新应用。" % (version, ready, total)
+        if detail.get("patchset_ver") and detail["patchset_ver"] != str(version):
+            line = "补丁集 %s 已就绪（用 %s 的补丁集，%s/%s），升级后会自动重新应用。" % (
+                version, detail["patchset_ver"], ready, total)
+        return line + (("（%s）" % gap) if gap else "")
     if state == "partial":
-        return "补丁集 %s 部分就绪（%s/%s），未命中项升级后会被跳过并记录。" % (version, ready, total)
+        line = "补丁集 %s 部分就绪（%s/%s），未命中项升级后会被跳过并记录。" % (version, ready, total)
+        if detail.get("patchset_ver") and detail["patchset_ver"] != str(version):
+            line = "补丁集 %s 部分就绪（用 %s 的补丁集，%s/%s），未命中项升级后会被跳过并记录。" % (
+                version, detail["patchset_ver"], ready, total)
+        return line + (("（%s）" % gap) if gap else "")
     if state == "missing":
         return "补丁集 %s 尚未就绪，升级后部分补丁可能不可用。" % version
     return "补丁集 %s 就绪状态未知（索引未取到，不影响升级）。" % version

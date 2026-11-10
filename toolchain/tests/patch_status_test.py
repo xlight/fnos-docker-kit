@@ -66,6 +66,39 @@ def main():
         (ok if got == expect else no)("select_patchset %s -> %s (want %s)" % (rv, got, expect))
     open(os.path.join(W, "version"), "w").write("1.2.1010\n")
 
+    # --- 3.8 覆盖缺口提示（参考级） ---
+    idx_cov = {"revision": 19, "versions": {
+        "1.2.1099": {"patchset": "fnos-1.2.1099.json", "sha256": "x", "ready": 36,
+                     "total": 36, "status": "ready", "validated_at": "t"}},
+        "coverage": {"1.2.1099": {"1.2.1099": {
+            "covered_files": 7, "total_files": 8, "status": "partial",
+            "missing": ["usr/trim/bin/a", "usr/trim/bin/b", "usr/trim/bin/c",
+                        "usr/trim/bin/d", "usr/trim/bin/e", "usr/trim/bin/f"]}}}}
+    open(m["PROXY_INDEX_PATH"], "w").write(json.dumps(idx_cov))
+    gap = m["coverage_gap"](m["read_proxy_index"](), "1.2.1099")
+    if gap and len(gap) == 6 and gap[-1].startswith("…等 "):
+        ok("3.8a 覆盖缺口最多列 5 条 + …等 M 项")
+    else:
+        no("3.8a 覆盖缺口条数/汇总错: %r" % (gap,))
+    gap_none = m["coverage_gap"]({"revision": 15, "versions": {}}, "1.2.1099")
+    if gap_none is None:
+        ok("3.8b 无矩阵索引不编造覆盖数字（返回 None）")
+    else:
+        no("3.8b 无矩阵时不该给覆盖信息: %r" % (gap_none,))
+    # 通知正文含覆盖缺口，且不抑制升级提示
+    open(m["PROXY_INDEX_PATH"], "w").write(json.dumps(idx_cov))
+    m["notify_postgres"]([], [], True)
+    sql_all = open(rec).read()
+    if "未覆盖" in sql_all and "usr/trim/bin/a" in sql_all:
+        ok("3.8c 通知正文含覆盖缺口（参考级）")
+    else:
+        no("3.8c 通知未含覆盖缺口")
+    if "已就绪" in sql_all:
+        ok("3.8d 覆盖提示不抑制升级提示")
+    else:
+        no("3.8d 升级提示被抑制")
+    open(rec, "w").write("")
+
     # --- 7.1 issues 通知 ---
     idx = {"revision": 1, "versions": {
         "1.2.1010": {"status": "ready", "ready": 37, "total": 37},

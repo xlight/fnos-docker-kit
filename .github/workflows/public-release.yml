@@ -1,0 +1,86 @@
+# 公开 CI 发布单元：**补丁集发布**（显式声明触发；不构建、不检测）
+# 设计来源：streamline-public-release-flow D1（观察/构建/发布三单元）、D8（预检）、D4（tag 不可变）
+#
+# 触发：workflow_dispatch，由发布声明（publish.sh --patchset <ver>）驱动。
+#   - 消费显式声明参数（patchset 版本 / 发布 tag），不猜、不自动发布。
+#   - 发布前校验就绪索引与补丁集自洽（索引条目 sha256 == 补丁集实际哈希）。
+#   - tag 不可变：已存在且内容合规 → 幂等跳过；已存在但内容不符 → 报错拒绝。
+#   - 重复触发不产生重复资产（--clobber 覆盖同名资产）。
+#
+# 镜像构建是**另一个单元**：发布成功后的镜像构建由 publish.sh --image <ver>
+# dispatch public-ci.yml；两个单元互不 needs。
+name: public-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      patchset:
+        description: "要发布的补丁集版本（如 1.2.1000）"
+        required: true
+      release_tag:
+        description: "发布 tag（留空 = v<patchset>；修正已发布内容请用新的修订号，如 v1.2.1000-r2）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析声明（补丁集版本 / 发布 tag）
+        id: plan
+        run: |
+          ver="${{ inputs.patchset }}"
+          ver="${ver#V}"
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="v${ver}"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${ver}" >> "$GITHUB_ENV"
+          echo "TAG=${tag}" >> "$GITHUB_ENV"
+          echo "PLAN: patchset=$ver tag=$tag"
+
+      - name: 校验就绪索引与补丁集自洽（发布前门禁）
+        id: verify
+        run: |
+          set -o pipefail
+          ps="toolchain/patches/fnos-${VERSION}.json"
+          idx="toolchain/patches/index.json"
+          [ -f "$ps" ] || { echo "补丁集缺失: $ps"; exit 1; }
+          [ -f "$idx" ] || { echo "索引缺失: $idx"; exit 1; }
+          # 索引必须是本 tag 内的那份（sync-public 生成，含全部版本），不重新生成
+          python3 toolchain/tests/validate-index.py --index "$idx"
+          idx_sha=$(python3 -c "import json;print(json.load(open('$idx'))['versions']['$VERSION']['sha256'])")
+          actual=$(sha256sum "$ps" | awk '{print $1}')
+          if [ "$idx_sha" != "$actual" ]; then
+            echo "索引 sha256 不一致: $idx_sha != $actual"; exit 1
+          fi
+          v_ready=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['ready'])")
+          v_total=$(python3 -c "import json;print(json.load(open('$ps'))['validation']['total'])")
+          echo "补丁集自洽: ready=$v_ready/$v_total sha256=$actual"
+
+      - name: 幂等发布补丁集与索引到 Release（单 job 串行 clobber）
+        run: |
+          set -o pipefail
+          ps="toolchain/patches/fnos-${VERSION}.json"
+          idx="toolchain/patches/index.json"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "patchset $VERSION" --generate-notes
+          gh release upload "$TAG" "$ps" "$idx" --clobber
+          echo "已发布: $TAG"
+
+      - name: 归档发布产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.plan.outputs.tag }}
+          path: |
+            toolchain/patches/fnos-${{ steps.plan.outputs.ver }}.json
+            toolchain/patches/index.json
+          if-no-files-found: warn

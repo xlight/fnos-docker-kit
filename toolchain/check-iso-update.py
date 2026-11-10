@@ -19,7 +19,12 @@ dlkey 自签），故"发现新版"与"能下载"必须分开判定。
   OTA 版本清单（apiv2-liveupdate 根路径匿名 GET，trim.version 为准）
     → deb 分支触发（ota_changed；CI 侧再查 Hub 有无对应 X-ota tag 去重，
     有底座（Hub 上低于目标版本的最高 tag）才构建）。
-任一通道失败 → rc=2（告警，不更新任何 state）。
+任一通道失败 → rc=2（告警）。
+
+state 语义（**各通道在各自成功点写入，互不阻塞**）：
+  页面解析成功 → 立即写 page state；OTA 取到版本 → 立即写 ota state。
+  任一通道失败只影响它自己：OTA 抓取失败时页面 state 已写入（rc=2 告警），
+  反之亦然。失败**不**把“抓不到”写成“无新版”——只有解析成功才写。
 
 输出：JSON 到 stdout，形如：
   {"current": {"version": "1.2.0701", "url": "...", "hash": "..."},
@@ -27,8 +32,7 @@ dlkey 自签），故"发现新版"与"能下载"必须分开判定。
    "ota": {"version": "1.2.0800"}, "ota_newer": true, "ota_changed": true}
 
 退出码：0=无变化；10=有新版且可下载；11=有新版但下载被拦；
-         2=任一通道抓取/解析失败（告警，不更新 state）。
-state 文件只在双通道都成功后更新（失败不覆盖，避免把"抓不到"当成"无新版"）。
+         2=任一通道抓取/解析失败（告警；已成功通道的 state 不受影响）。
 """
 import json
 import os
@@ -36,13 +40,13 @@ import re
 import sys
 import urllib.request
 
-PAGE = "https://fnnas.com/download"
+PAGE = os.environ.get("FNOS_PAGE_URL", "https://fnnas.com/download")
 STATE_ENV = "ISO_STATE_FILE"
 SIGN_PATH = "/asset/download-sign"
 SIGN_S1 = "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh"
 SIGN_S2 = "4fac7e99-ef43-4b6c-9ca8-5bbca4a4210e"
 # OTA 版本清单：根路径匿名 GET 即可（无参数无鉴权；响应 = JSON + 不定长二进制尾巴）
-OTA_URL = "https://apiv2-liveupdate.fnnas.com/"
+OTA_URL = os.environ.get("FNOS_OTA_URL", "https://apiv2-liveupdate.fnnas.com/")
 OTA_UA = "wb.apt/2.6.1 (linux amd64)"
 
 # 页面内嵌转义 JSON：download\":{\"version\":\"X\",\"url\":\"...\",\"hash\":\"...\",...}
@@ -115,6 +119,24 @@ def sign_url(url, timeout=20):
         return json.load(r)["url"]
 
 
+def write_state(path, value):
+    """原子写 state 文件（单行版本号）。写失败不致命（调用方只告警）。"""
+    if not path:
+        return
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(value).strip() + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        print("[state] write failed %s: %s" % (path, e), file=sys.stderr, flush=True)
+
+
 def main():
     page = PAGE
     state_file = os.environ.get(STATE_ENV, "")
@@ -138,42 +160,64 @@ def main():
         elif args[i] == "--no-ota":
             do_ota = False
         i += 1
+    # ---- 双通道**各自独立**尝试：一方失败不牵连另一方（2.1b）----
+    page_err = None
+    cur = None
     try:
         html = fetch(page)
+        found = {}
+        for m in RE_BLOCK.finditer(html):
+            ver, url, h = m.group(1), m.group(2), m.group(3)
+            found[ver] = {"version": ver, "url": url, "hash": h}
+        if not found:
+            raise ValueError("parse-failed: no download block")
+        # 取最高版本（x86 主线优先： presently only x86 blocks carry Mainland-PE iso）
+        cur = found[sorted(found)[-1]]
     except Exception as e:
-        print(json.dumps({"error": "fetch-failed: %s" % e}), flush=True)
-        return 2
-    found = {}
-    for m in RE_BLOCK.finditer(html):
-        ver, url, h = m.group(1), m.group(2), m.group(3)
-        found[ver] = {"version": ver, "url": url, "hash": h}
-    if not found:
-        print(json.dumps({"error": "parse-failed: no download block"}), flush=True)
-        return 2
-    # 取最高版本（x86 主线优先： presently only x86 blocks carry Mainland-PE iso）
-    cur = found[sorted(found)[-1]]
-    recorded = ""
-    if state_file and os.path.isfile(state_file):
-        recorded = open(state_file).read().strip()
-    out = {"current": cur, "recorded": recorded,
-           "changed": cur["version"] != recorded if recorded else True,
-           "downloadable": None, "ota": None, "ota_newer": None}
+        page_err = str(e)
+
+    ota_err = None
+    over = None
     if do_ota:
         try:
             over = ota_trim_version()
         except Exception as e:
-            print(json.dumps({"error": "ota-failed: %s" % e}), flush=True)
-            return 2
+            ota_err = str(e)
+
+    # 记录**本次运行前**的 state 值（先读后写）
+    recorded = ""
+    if state_file and os.path.isfile(state_file):
+        recorded = open(state_file).read().strip()
+    recorded_ota = ""
+    if ota_state_file and os.path.isfile(ota_state_file):
+        recorded_ota = open(ota_state_file).read().strip()
+
+    # 各通道在**自己的成功点**写 state
+    if cur is not None and state_file:
+        write_state(state_file, cur["version"])
+    if over is not None and ota_state_file:
+        write_state(ota_state_file, over)
+
+    if cur is None:
+        print(json.dumps({"error": "page-failed: %s" % page_err,
+                          "ota": {"version": over} if over else None}), flush=True)
+        return 2
+    out = {"current": cur, "recorded": recorded,
+           "changed": cur["version"] != recorded if recorded else True,
+           "downloadable": None, "ota": None, "ota_newer": None}
+    if over is not None:
         out["ota"] = {"version": over}
-        out["ota_newer"] = _vkey(over) > _vkey(cur["version"])
-        recorded_ota = ""
-        if ota_state_file and os.path.isfile(ota_state_file):
-            recorded_ota = open(ota_state_file).read().strip()
         out["ota_recorded"] = recorded_ota
         out["ota_changed"] = (over != recorded_ota) if recorded_ota else True
+        out["ota_newer"] = _vkey(over) > _vkey(cur["version"])
         # 人类可读行走 stderr（stdout 只留 JSON，下游按 JSON 解析）
         print("[ota] trim=%s ota_newer=%s ota_changed=%s (page=%s)" % (
             over, out["ota_newer"], out["ota_changed"], cur["version"]),
+              file=sys.stderr, flush=True)
+    if ota_err is not None:
+        # OTA 失败：告警并 rc=2，但 page state 已写（页面通道不受牵连）
+        out["ota_error"] = ota_err[:200]
+        print("[ota] failed: %s（page 通道不受影响，page state 已写）" % ota_err[:160],
               file=sys.stderr, flush=True)
     if do_probe:
         out["downloadable"] = probe(cur["url"])
@@ -184,10 +228,8 @@ def main():
             out["signed_url"] = None
             out["sign_error"] = str(e)[:200]
     print(json.dumps(out, ensure_ascii=False))
-    if state_file:
-        open(state_file, "w").write(cur["version"] + "\n")
-    if do_ota and ota_state_file and out.get("ota", {}).get("version"):
-        open(ota_state_file, "w").write(out["ota"]["version"] + "\n")
+    if ota_err is not None:
+        return 2
     if not out["changed"]:
         return 0
     if not do_probe:

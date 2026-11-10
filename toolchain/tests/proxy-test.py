@@ -120,6 +120,30 @@ def main():
         (lambda r: r.full_url.startswith("https://apiv2-liveupdate.fnnas.com/branch/check"), lambda r: FakeResp(200, json.dumps({"data": {"version": "1.2.1010", "versionId": 1791, "packages": [{"packageName": "linux-image-trim"}, {"packageName": "trim"}]}}).encode(), {"Content-Type": "application/json"})),
     ]
     m = load_proxy(make_upstream(routes, record), index)
+    # 3.5 覆盖度矩阵：部分覆盖时状态行点名未覆盖文件
+    cov_index = {
+        "revision": 19, "generated": "t",
+        "versions": {
+            "1.2.1099": {"patchset": "fnos-1.2.1099.json", "sha256": "x", "ready": 36,
+                         "total": 36, "status": "ready", "validated_at": "t"}},
+        "coverage": {"1.2.1099": {"1.2.1100": {
+            "covered_files": 7, "total_files": 8, "status": "partial",
+            "missing": ["usr/trim/bin/resmon_service", "usr/trim/lib/libnfile.so",
+                        "usr/trim/lib/libnperm.so", "usr/trim/lib/libtrimacl.so",
+                        "usr/trim/lib/libextra.so", "usr/trim/lib/libextra2.so"]}}},
+    }
+    m["_index_cache"].update(data=cov_index, fetched_at=time.time(), revision=19)
+    line = m["status_line"]("1.2.1100")
+    assert "未覆盖" in line and "resmon_service" in line, line
+    assert "…等 1 项" in line, line
+    assert "1.2.1099" in line, line          # 用的是更早的候选补丁集
+    ok("3.5 部分覆盖时状态行点名未覆盖文件（并说明用的是哪个补丁集）")
+    # 无矩阵（旧索引）→ 精确版本语义，行为不变
+    m["_index_cache"].update(data=index, fetched_at=time.time(), revision=1)
+    line_old = m["status_line"]("1.2.1099")
+    assert "已就绪（36/36）" in line_old and "未覆盖" not in line_old, line_old
+    ok("3.6 无矩阵索引：精确版本语义不变")
+    m["_index_cache"].update(data=index, fetched_at=time.time(), revision=1)
     port = 18080
     srv = start_server(m, port)
     time.sleep(0.2)

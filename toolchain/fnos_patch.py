@@ -112,6 +112,34 @@ TRASH_DROPIN_BODY = (
     "Environment=LD_PRELOAD=/usr/local/lib/libfnos-trashshim.so\n"
 )
 
+# ---- 构建所需文件集合（design D11：公开清单与 CI 的机器契约）----
+# apply()（= pipeline 的 stage_patch）会读取/拷贝的全部源文件。公开仓必须包含
+# 这些文件，缺一个就要等到 CI 里才炸。路径一律是**公开树相对路径**
+# （公开仓根 = 私有仓 fnos/ 根）。
+REPO_ROOT = os.path.dirname(TOOLCHAIN_DIR)
+BUILD_INPUTS = (
+    ("toolchain/aobpatch.py", lambda: os.path.join(TOOLCHAIN_DIR, "aobpatch.py")),
+    ("toolchain/assets/libfnos-trashshim.so", lambda: TRASH_ASSET),
+    ("toolchain/fnos-lib-consumers", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers")),
+    ("toolchain/fnos-nginx-route.sh", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-nginx-route.sh")),
+    ("toolchain/fnos-patch-status", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-patch-status")),
+    ("toolchain/fnos-patchset-fetch", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-patchset-fetch")),
+    ("scripts/stor-mount-shim.sh", lambda: os.path.join(REPO_ROOT, "scripts", "stor-mount-shim.sh")),
+)
+
+# apply() 里每个 copy2 源表达式 -> 公开树相对路径（自检用）。
+# 新增 copy2 源而不在此登记 → 自检失败（这是"契约不靠人记"的兜底）。
+COPY_SOURCE_RESOLVERS = {
+    "mount_shim": "scripts/stor-mount-shim.sh",
+    "TRASH_ASSET": "toolchain/assets/libfnos-trashshim.so",
+    "patch_status_src": "toolchain/fnos-patch-status",
+    "patches": "@patchset",  # 动态：随 --patches/版本变化
+    'os.path.join(TOOLCHAIN_DIR, "aobpatch.py")': "toolchain/aobpatch.py",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-patchset-fetch")': "toolchain/fnos-patchset-fetch",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers")': "toolchain/fnos-lib-consumers",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-nginx-route.sh")': "toolchain/fnos-nginx-route.sh",
+}
+
 # ---- 需在镜像内屏蔽的 systemd 单元 ----
 # 背景（2026-10-11 事故复盘）：nfsd 的 /proc/net/rpc/nfsd.* 是**宿主内核全局态**——
 # 在容器里跑 fnOS 的 nfs-server，等于直接在宿主起 rpc.nfsd。多个 fnOS 实例
@@ -1011,15 +1039,122 @@ def resolve_patchset(rootfs, patches=None):
     return cand
 
 
+def _rel_to_repo(path):
+    """绝对路径 -> 公开树相对路径（不在仓内则原样返回绝对路径）。"""
+    ap = os.path.abspath(path)
+    rp = os.path.abspath(REPO_ROOT)
+    if ap == rp or ap.startswith(rp + os.sep):
+        return os.path.relpath(ap, rp)
+    return ap
+
+
+def required_files(patches=None, mount_shim=None, version=None):
+    """构建所需文件集合（公开树相对路径，稳定排序）。
+
+    patches  : 具体补丁集路径（动态输入）；缺省时按 version 推导。
+    mount_shim: mount shim 路径（动态输入）；缺省为 scripts/stor-mount-shim.sh。
+    version  : fnOS 版本（用于在不给补丁集路径时推导补丁集相对路径）。
+    """
+    out = {rel for rel, _ in BUILD_INPUTS}
+    out.add(_rel_to_repo(mount_shim) if mount_shim else "scripts/stor-mount-shim.sh")
+    if patches:
+        out.add(_rel_to_repo(patches))
+    elif version:
+        out.add("toolchain/patches/fnos-%s.json" % str(version).lstrip("Vv"))
+    return sorted(out)
+
+
+def _copy2_first_args(src):
+    """扫出源码里所有 shutil.copy2(...) 的**第一个**参数（按括号配平切分）。
+
+    不用正则：参数里本身带括号与逗号（os.path.join(a, b)），正则会切错。
+    """
+    out = []
+    needle = "shutil.copy2("
+    i = 0
+    while True:
+        j = src.find(needle, i)
+        if j < 0:
+            break
+        k = j + len(needle)
+        depth = 1
+        buf = []
+        while k < len(src):
+            ch = src[k]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == "," and depth == 1:
+                break
+            buf.append(ch)
+            k += 1
+        out.append(re.sub(r"\s+", " ", "".join(buf).strip()))
+        i = k + 1
+    return out
+
+
+def self_check_required_files(patches=None, mount_shim=None, version=None):
+    """自检：apply() 里实际 copy2 的源集合 == required_files() 报告的集合。
+
+    做法：解析 apply() 源码里的 shutil.copy2(...) 源表达式，逐个用
+    COPY_SOURCE_RESOLVERS 解析成公开树路径；解析不到即视为"新增了未登记的
+    构建输入"→ 失败。补丁集是动态项，按需比对。
+    """
+    import inspect
+    src = inspect.getsource(apply)
+    exprs = _copy2_first_args(src)
+    resolved = []
+    unknown = []
+    for e in exprs:
+        if e not in COPY_SOURCE_RESOLVERS:
+            unknown.append(e)
+            continue
+        resolved.append(COPY_SOURCE_RESOLVERS[e])
+    if unknown:
+        raise RuntimeError("apply() 出现未登记的 copy2 源（需登记进 COPY_SOURCE_RESOLVERS"
+                           " 与 BUILD_INPUTS）：%s" % "; ".join(unknown))
+    static = {r for r in resolved if r != "@patchset"}
+    expect = set(required_files(patches=None, mount_shim=mount_shim, version=None))
+    missing = expect - static
+    extra = static - expect
+    if missing or extra:
+        raise RuntimeError("构建依赖集合与 apply() 实际读取源不一致：缺 %s / 多 %s"
+                           % (sorted(missing) or "-", sorted(extra) or "-"))
+    return sorted(expect)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["apply", "status"])
-    ap.add_argument("--rootfs", required=True)
+    ap.add_argument("cmd", nargs="?", choices=["apply", "status", None])
+    ap.add_argument("--rootfs", default=None)
     ap.add_argument("--patches", default=None,
                     help="补丁集路径；缺省按 rootfs 版本自动选择（找不到则失败，永不默认旧版本）")
     ap.add_argument("--mount-shim", default=os.path.normpath(os.path.join(TOOLCHAIN_DIR, "..", "scripts", "stor-mount-shim.sh")))
     ap.add_argument("--no-version-check", action="store_true")
+    ap.add_argument("--required-files", action="store_true",
+                    help="打印构建所需文件集合（公开树相对路径，每行一个）后退出")
+    ap.add_argument("--version", default=None,
+                    help="配合 --required-files：按 fnOS 版本推导补丁集相对路径")
+    ap.add_argument("--self-check", action="store_true",
+                    help="自检：required_files 与 apply() 实际读取源是否一致")
     a = ap.parse_args()
+    if a.required_files or a.self_check:
+        if a.self_check:
+            files = self_check_required_files(patches=a.patches, mount_shim=a.mount_shim,
+                                               version=a.version)
+            print("SELF-CHECK OK: %d 个构建输入与 apply() 一致" % len(files))
+        else:
+            files = required_files(patches=a.patches, mount_shim=a.mount_shim, version=a.version)
+        for f in files:
+            print(f)
+        return
+    if not a.cmd:
+        ap.error("需要子命令 apply/status（或用 --required-files）")
+    if not a.rootfs:
+        ap.error("apply/status 需要 --rootfs")
     if os.geteuid() != 0:
         print("需要 root", file=sys.stderr); sys.exit(1)
     if a.cmd == "apply":
