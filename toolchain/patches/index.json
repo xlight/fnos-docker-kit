@@ -1,6 +1,6 @@
 {
-  "revision": 18,
-  "generated": "2026-11-09T06:07:19Z",
+  "revision": 19,
+  "generated": "2026-11-10T13:57:10Z",
   "versions": {
     "1.2.1000": {
       "patchset": "fnos-1.2.1000.json",
@@ -8,7 +8,8 @@
       "ready": 37,
       "total": 37,
       "status": "ready",
-      "validated_at": "2026-11-08T05:57:54Z"
+      "validated_at": "2026-11-08T05:57:54Z",
+      "source_commit": "48e7ad7820f6a1c9c87f332201ae010f4bb8de56"
     },
     "1.2.1010": {
       "patchset": "fnos-1.2.1010.json",
@@ -16,7 +17,8 @@
       "ready": 37,
       "total": 37,
       "status": "ready",
-      "validated_at": "2026-11-09T05:00:14Z"
+      "validated_at": "2026-11-09T05:00:14Z",
+      "source_commit": "48e7ad7820f6a1c9c87f332201ae010f4bb8de56"
     }
   }
 }
