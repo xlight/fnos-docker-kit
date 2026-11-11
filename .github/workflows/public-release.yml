@@ -315,6 +315,7 @@ jobs:
 
       - name: 发布 Release 资产（tag 与 Release 两个独立存在性检查）
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
