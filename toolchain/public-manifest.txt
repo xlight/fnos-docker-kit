@@ -47,6 +47,7 @@ toolchain/tests/publish-test.sh
 toolchain/tests/fingerprints-test.py
 toolchain/tests/patchset-fetch-test.py
 toolchain/tests/index-matrix-test.py
+toolchain/tests/selfheal-test.sh
 toolchain/index_builder.py
 toolchain/fnos_rootfs.py
 toolchain/release-content.sh
@@ -58,6 +59,7 @@ scripts/stor-manage.sh
 scripts/stor-mountdir.sh
 scripts/stor-mask.sh
 scripts/stor-mount-shim.sh
+scripts/stor-selfheal.sh
 scripts/stor-manage-docker.sh
 scripts/stor-mask-docker.sh
 scripts/fnos_deploy_docker.sh

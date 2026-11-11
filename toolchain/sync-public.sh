@@ -286,6 +286,14 @@ case "$CMD" in
       rm -rf "$preserve_tmp"
     fi
     rm -rf "$tmp"
+    # **属主归位**：用 root 跑同步会留下 root 属主的文件，之后普通用户 git 操作
+    # 会报 "insufficient permission for adding an object"（2026-11-11 踩到）。
+    # 按调用者（SUDO_USER）或目标仓原属主 chown 回去。
+    local owner="${SUDO_USER:-${USER:-root}}"
+    [ "$owner" = "root" ] && owner="$(stat -c '%U' "$DST" 2>/dev/null || echo root)"
+    if [ "$owner" != "root" ] && id "$owner" >/dev/null 2>&1; then
+      chown -R "$owner":"$(id -gn "$owner")" "$DST" 2>/dev/null || true
+    fi
     (cd "$DST" && git add -A && git status --short | head -5 && git commit -qm "sync: $(date -u +%Y%m%dT%H%M%SZ)" && git rev-parse --short HEAD)
     log "已提交到公开仓工作区（推送请手动 git push，或配 remote 后加推）"
     ;;

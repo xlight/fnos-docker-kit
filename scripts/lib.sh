@@ -108,34 +108,119 @@ ct_node_helper_render() { # $1=helper 路径（进 top 注释）；stdout=通用
   local hn; hn="$(basename "${1:-fnos-node-unit.sh}")"
   sed "s|__HN__|$hn|g" <<'HELPER'
 #!/bin/sh
-# __HN__ —— fnOS LXC 静态节点 helper（由 lib.sh:ct_node_unit_ensure 生成）
-# 用法: __HN__ <canon> [node...]；canon=整盘名（自动补全其分区）
-#   node：块设备名（默认形状）或 c:<name>（字符设备，经 /proc/misc 查次号）
-# 号段每次从 sysfs/procfs 现取；缺项跳过；exit 0 从不挡开机
-C="${1:?canon}"; shift; M=/sys/block/$C
-mknode() { rm -f "$1"; /bin/mknod "$1" "$2" "$3" "$4"; /bin/chown root:disk "$1"; /bin/chmod 660 "$1"; }
-resolve_blk() {
-  local n=$1 mm p
-  mm="$(cat /sys/block/$n/dev 2>/dev/null)" && { echo "$mm"; return 0; }
-  for p in /sys/block/*/$n/dev; do
-    [ -f "$p" ] || continue
-    mm="$(cat $p 2>/dev/null)" && { echo "$mm"; return 0; }
-  done
-  return 1
-}
-resolve_char() { awk -v n="$1" '$2==n{print "c 10 "$1; exit}' /proc/misc; }
-mm="$(cat $M/dev 2>/dev/null)" && mknode /dev/$C b ${mm%%:*} ${mm##*:}
-for p in $M/${C}[0-9]* $M/${C}p[0-9]*; do
-  [ -e "$p" ] || continue
-  pm="$(cat $p/dev 2>/dev/null)" || continue
-  mknode /dev/${p##*/} b ${pm%%:*} ${pm##*:}
-done
-for e in "$@"; do
-  case "$e" in
-    c:*) n="${e#c:}"; set -- $(resolve_char "$n"); [ -n "${1:-}" ] || continue; mknode /dev/$n "$1" "$2" "$3" ;;
-    *)   n="${e#b:}"; mm="$(resolve_blk "$n")" || continue; mknode /dev/$n b ${mm%%:*} ${mm##*:} ;;
+# __HN__ —— fnOS LXC 节点 helper（运行时按**当前**设备身份建节点）
+#
+# 为什么不再用"把 md/dm 号写死"的旧做法：
+#   宿主每次重启都会重建 md/LV/nvme 链路，**设备号会漂移**（md126→md127、
+#   dm-3→dm-4 …）。旧 helper 把 10 月那次的号写进 unit，宿主一重启就过期，
+#   容器里缺 /dev/dm-N → fnOS 挂 /volN 失败（CT201 2026-11-10 就是这么坏的：
+#   /vol2 每 6 秒重试一次挂不上，宿主侧 md/LV 全都好好的）。
+#
+# 现在：每次容器开机都按 **/sys/block 的当前视图**重建节点。
+#   * 容器里的 /sys/block 是宿主 /sys/block 的**掩码视图**（stor-mask.sh 决定
+#     哪些设备对本 CT 可见）→ 视图里有什么就建什么节点，天然只暴露本栈设备。
+#   * 号段每次现取（/sys/block/<dev>/dev）→ 号漂移免疫。
+#   * 分区节点也从视图里现取。
+#
+# 用法: __HN__ [--usb-serial <SERIAL> --usb-canon <NAME>] [--wait <SEC>]
+#   --usb-serial/--usb-canon：把某块 USB 盘在容器内**固定**成 /dev/<canon>
+#     （宿主盘符会漂移，容器内名字按设计 pin 死）；找不到就跳过。
+#   --wait：设备还没出现时轮询等待（默认 30s，每 2s 一轮）。
+#
+# 号段从 sysfs/procfs 现取；缺项跳过；**exit 0 从不挡开机**。
+WAIT=30
+USB_SERIAL=""
+USB_CANON=""
+CHAR_DEV=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --usb-serial) USB_SERIAL="${2:-}"; shift 2;;
+    --usb-canon)  USB_CANON="${2:-}"; shift 2;;
+    --wait)       WAIT="${2:-30}"; shift 2;;
+    c:*)          CHAR_DEV="${CHAR_DEV} ${1#c:}"; shift;;   # 字符设备（zfs 等）
+    *)            shift;;                                   # 纯设备名：由扫描覆盖，忽略
   esac
 done
+
+mknode() { # <path> <maj> <min>
+  [ -e "$1" ] && return 0
+  rm -f "$1" 2>/dev/null
+  /bin/mknod "$1" b "$2" "$3" 2>/dev/null || return 1
+  /bin/chown root:disk "$1" 2>/dev/null
+  /bin/chmod 660 "$1" 2>/dev/null
+  return 0
+}
+
+# 把视图里的每个块设备（含分区）按当前号段建节点
+scan_nodes() {
+  local d p name mm pm
+  for d in /sys/block/*; do
+    [ -d "$d" ] || continue
+    name="${d##*/}"
+    mm="$(cat "$d/dev" 2>/dev/null)" || continue
+    [ -n "$mm" ] || continue
+    mknode "/dev/$name" "${mm%%:*}" "${mm##*:}"
+    # 分区（/sys/block/<disk>/<disk><part>）
+    for p in "$d"/*; do
+      [ -e "$p" ] || continue
+      pm="$(cat "$p/dev" 2>/dev/null)" || continue
+      [ -n "$pm" ] || continue
+      mknode "/dev/${p##*/}" "${pm%%:*}" "${pm##*:}"
+    done
+  done
+}
+
+# USB 规范名：按 serial 找整盘 → 建 /dev/<canon>（容器内名字 pin 死）
+usb_canon_node() {
+  [ -n "$USB_SERIAL" ] && [ -n "$USB_CANON" ] || return 0
+  local d name mm ser
+  for d in /sys/block/*; do
+    [ -d "$d" ] || continue
+    ser="$(cat "$d/device/serial" 2>/dev/null)" || continue
+    [ "$ser" = "$USB_SERIAL" ] || continue
+    name="${d##*/}"
+    mm="$(cat "$d/dev" 2>/dev/null)" || continue
+    rm -f "/dev/$USB_CANON" 2>/dev/null
+    mknode "/dev/$USB_CANON" "${mm%%:*}" "${mm##*:}"
+    echo "[node] USB canonical: /dev/$USB_CANON <- $name ($mm)"
+    return 0
+  done
+  return 0
+}
+
+# 等设备出现：视图里至少有一个 dm-* 且 /dev 下有对应节点
+wait_ready() {
+  local i=0 d
+  while [ "$i" -lt "$WAIT" ]; do
+    for d in /sys/block/dm-*; do
+      [ -d "$d" ] || continue
+      mm="$(cat "$d/dev" 2>/dev/null)" || continue
+      if [ -e "/dev/${d##*/}" ]; then return 0; fi
+    done
+    sleep 2; i=$((i+2))
+  done
+  return 0
+}
+
+# 字符设备（c:<name>，号段从 /proc/misc 现取）
+char_nodes() {
+  local n set major minor
+  for n in $CHAR_DEV; do
+    set=$(awk -v n="$n" '$2==n{print $1" "$3; exit}' /proc/misc 2>/dev/null)
+    [ -n "$set" ] || continue
+    major="$(echo "$set" | awk '{print $1}')"; minor="$(echo "$set" | awk '{print $2}')"
+    [ -e "/dev/$n" ] && continue
+    /bin/mknod "/dev/$n" c "$major" "$minor" 2>/dev/null && /bin/chmod 666 "/dev/$n" 2>/dev/null
+  done
+}
+
+scan_nodes
+char_nodes
+usb_canon_node
+wait_ready
+scan_nodes
+char_nodes
+usb_canon_node
 exit 0
 HELPER
 }

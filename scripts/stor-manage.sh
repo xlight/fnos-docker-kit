@@ -188,11 +188,18 @@ ensure_passthrough() {
   md_mm="$(cat "/sys/class/block/$mdn/dev" 2>/dev/null)"
   dm_mm="$(cat "/sys/class/block/$dmn/dev" 2>/dev/null)"
   nv_mm="$(cat "/sys/class/block/${NVME_DEV}p1/dev" 2>/dev/null)"
+  nv_disk_mm="$(cat "/sys/class/block/${NVME_DEV}/dev" 2>/dev/null)"
   local v
-  for v in "md:$md_mm" "dm:$dm_mm" "nvme:${nv_mm}"; do
+  for v in "md:$md_mm" "dm:$dm_mm" "nvme:${nv_mm}" "nvme-disk:${nv_disk_mm}"; do
     [ -n "${v##*:}" ] || die "读不到 ${v%%:*} 号段（$mdn/$dmn/${NVME_DEV}p1），拒绝写半截配置"
   done
   local C="/etc/pve/lxc/${CTID}.conf"
+  # **pmxcfs 竞态**：宿主开机瞬间 /etc/pve/lxc/<id>.conf 可能还没重建（pmxcfs 尚未落盘），
+  # 此时写入会 "No such file or directory" 全部落空 → 容器起来后缺 cgroup 放行与节点。
+  # 这里等到配置文件出现再写（最多 60s）。
+  local wi=0
+  while [ ! -f "$C" ] && [ "$wi" -lt 60 ]; do sleep 1; wi=$((wi+1)); done
+  [ -f "$C" ] || die "等待 ${C} 出现超时（pmxcfs 未就绪？）"
   # 清理：本方案旧行（含退役 bind）、旧 md cgroup rw 行（只读行由 fnos-ct-guard 管）。
   # 按精确整行删除（旧正则对 md125/dm-5/nvme1n1p1 这类带数字的名字会失配）。
   local tmp; tmp="$(mktemp)"
@@ -207,27 +214,67 @@ ensure_passthrough() {
     -e "lxc.cgroup2.devices.allow: c 10:249 rw" \
     -e "lxc.mount.entry: /dev/zfs dev/zfs none bind,optional,create=file" \
     "$C" > "$tmp" || true
+  # 再清一遍：指向**宿主上已不存在设备**的放行行（设备号漂移后的残留，如旧的
+  # 252:8 / 9:1 / 259:7）。只删"设备确实不存在"的行，不碰仍然存在的设备。
+  local stale line mm maj min
+  stale="$(grep -E '^lxc\.cgroup2\.devices\.allow: b [0-9]+:[0-9]+ ' "$tmp" 2>/dev/null | sort -u)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    mm="$(echo "$line" | awk '{print $3}')"
+    case "$mm" in *:*) ;; *) continue;; esac
+    maj="${mm%%:*}"; min="${mm##*:}"
+    if [ ! -e "/dev/block/${maj}:${min}" ]; then
+      grep -vFx "$line" "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+      log "清理失效放行行（设备已不存在）：$line"
+    fi
+  done <<EOF
+$stale
+EOF
   cat "$tmp" > "$C"; rm -f "$tmp"
   {
     echo "dev${DEVID}: ${DM_DEV}"
+    echo "lxc.cgroup2.devices.allow: b ${md_mm} rw"
     echo "lxc.cgroup2.devices.allow: b ${dm_mm} rw"
     echo "lxc.cgroup2.devices.allow: b ${nv_mm} rw"
+    [ -n "$nv_disk_mm" ] && echo "lxc.cgroup2.devices.allow: b ${nv_disk_mm} rw"
     if [ "${VOLFS:-ext4}" = "zfs" ]; then echo "lxc.cgroup2.devices.allow: c 10:249 rw"; fi
   } >> "$C"
-  # 容器内静态节点 unit（md/dm/nvme 成员 [+zfs 字符节点]）
-  local nargs="${mdn} ${dmn} ${NVME_DEV} ${NVME_DEV}p1"
+  # 容器内静态节点 unit：**不再写死 md/dm 号**——helper 每次开机按容器内
+  # /sys/block 的**当前**视图（掩码后的本栈设备）解析并建节点，宿主重启导致
+  # 号漂移时也不会过期（2026-11-10 CT201 /vol2 挂不上的根因）。
+  local nargs="--wait 30"
   if [ "${VOLFS:-ext4}" = "zfs" ]; then nargs="$nargs c:zfs"; fi
   # shellcheck disable=SC2086
   ct_node_unit_ensure "$CTID" "fnos-stornode-${CTID}.service" "/usr/local/sbin/fnos-stornode.sh" \
-    "fnOS storage stack static nodes (CT${CTID}: md/dm/nvme)" $nargs
+    "fnOS storage stack nodes (CT${CTID}: runtime-resolved from /sys/block)" $nargs
   log "透传：dev${DEVID}=${DM_DEV} + cgroup(dm=${dm_mm},nvme=${nv_mm}) + nodes(${nargs})"
 }
 
 # ---------- 5) /sys/block 动态屏蔽（stor-mask.sh apply=并集：不摘除其它栈已暴露设备） ----------
 ensure_mask() {
   load_state
+  local MASK="/var/lib/lxc/${CTID}/sysblock"
   local mdn dmn; mdn="$(basename "$MD_DEV")"; dmn="$(basename "$(readlink -f "$DM_DEV")")"
-  DEVS="${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}" bash "$SCRIPT_DIR/stor-mask.sh" apply >/dev/null 2>&1 && log "已应用 /sys/block 屏蔽（${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}）"
+  # md 的**组件盘**也必须暴露：fnOS 的 md 健康判定按超级块里记的组件名去
+  # /sys/block 找盘，组件不可见 → arrayState=broken（2026-11-11 CT201 现象）。
+  local comps="" c
+  for c in /sys/block/"${mdn}"/slaves/*; do
+    [ -e "$c" ] || continue
+    comps="$comps $(basename "$c")"
+  done
+  DEVS="${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}" bash "$SCRIPT_DIR/stor-mask.sh" apply >/dev/null 2>&1 \
+    && log "已应用 /sys/block 屏蔽（${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}）"
+  # 组件盘（md 的 slaves）常是**分区**（如 zd0p1），不在 /sys/block/<name> 下，
+  # 掩码脚本的裸名逻辑会跳过 → 这里按真实路径显式建软链（含其父盘）。
+  local cbase ctgt
+  for cbase in $comps; do
+    ctgt="$(readlink -f "/sys/block/${mdn}/slaves/${cbase}" 2>/dev/null)"
+    [ -n "$ctgt" ] && [ -e "$ctgt" ] || continue
+    ln -sfn "$ctgt" "$MASK/$cbase" && log "掩码暴露组件: $cbase"
+    local cparent; cparent="$(dirname "$ctgt")"
+    [ -e "$cparent" ] || continue
+    ln -sfn "$cparent" "$MASK/$(basename "$cparent")" && log "掩码暴露组件父盘: $(basename "$cparent")"
+  done
 }
 
 # ---------- 5b) zfs：容器侧挂载 unit ----------

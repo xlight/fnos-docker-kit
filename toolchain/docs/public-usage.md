@@ -58,6 +58,24 @@ bash tests/pipeline_test.sh   # 编排器（无需容器）
 - 容器内个别服务（如 `trim_trashbind`）会因缺专用内核设备而重启循环：预期内，不影响文件/应用。
 - Web UI 的存储"未激活"标签在容器下是已知显示问题：功能正常即可忽略。
 
+## 4b. 存储栈自愈巡检（宿主侧）
+
+`scripts/stor-selfheal.sh` 定期检查 fnOS LXC 的存储栈是否"真的健康"（不只看容器起没起）：
+
+```bash
+sudo env CTID=<id> bash scripts/stor-selfheal.sh check     # 只诊断
+sudo env CTID=<id> bash scripts/stor-selfheal.sh repair    # 检查 + 修复 + 复核
+```
+
+检查项：宿主存储栈（zvol/nvmet/md/LV）、容器透传与 cgroup 放行、**掩码视图**（含 md 的
+组件分区——少了它 fnOS 会把卷判成"已损坏"）、容器内设备节点、fnOS 登记卷是否真的挂上。
+修复后自动复核；带**防抖**（冷却期 + 24h 重启预算），不会反复重启容器。
+
+宿主侧配套单元（`repair` 自动落装）：`fnos-stor-ct<ID>.service`（开机）、
+`fnos-stor-ct<ID>-usb.timer`（每日，USB 盘换名/重插后跟上）、
+`fnos-stor-selfheal-ct<ID>.timer`（每 2 小时巡检）。
+
+
 ## 5. 来源声明、下架承诺与发布渠道对齐（合规）
 
 - **来源声明**：本仓库不含任何 fnOS 二进制；所有镜像均由使用者从飞牛官方渠道取得的材料构建。自动发布的 Docker 镜像同样如此：ISO 分支衍生自官方 ISO，仅叠加容器兼容补丁；`-ota` 分支以已发布的公开镜像为底座，叠加官方 OTA `.deb` 包组的文件内容（逐包 sha256 与官方清单比对），不等官方 ISO 上架。本项目与飞牛官方无关，不代表官方立场。
