@@ -1,0 +1,51 @@
+{
+  "fnos_version": "1.2.1010",
+  "patchset_sha256": "31abd0e7636a50e1031864f3197dffd55be73f05753b469cf3f433ea3538e7dc",
+  "probes": [
+    {
+      "name": "appcgi.resmon.net → succ 且含 eth0",
+      "ok": true,
+      "detail": "errno=None ifs=['veth373439a', 'br-775f75123d06', 'eth0']"
+    },
+    {
+      "name": "downloadcenter.getDirFreeSpace → succ（doc 35）",
+      "ok": true,
+      "detail": "errno=None"
+    },
+    {
+      "name": "file.rm 空目录 → 无 errno 327696（doc 36）",
+      "ok": null,
+      "skipped": "<redacted>",
+      "detail": "破坏性探针默认跳过（--with-destructive 可显式执行）"
+    },
+    {
+      "name": "www 主 bundle 可取（站点可用）",
+      "ok": true,
+      "detail": "index-D1auxRov.js → 200"
+    }
+  ],
+  "patch_status": {
+    "healthy": true,
+    "issue_count": 0,
+    "layers": {
+      "aob": {
+        "ok": true,
+        "issue_count": 0,
+        "patch_count": 37
+      },
+      "mechanism": {
+        "ok": true,
+        "issue_count": 0,
+        "check_count": 17
+      },
+      "image": {
+        "ok": true,
+        "issue_count": 0,
+        "check_count": 13
+      }
+    }
+  },
+  "destructive_probe": false,
+  "created_at": "2026-11-11T07:22:31Z",
+  "author": "xlight"
+}

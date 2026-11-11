@@ -1,0 +1,8 @@
+{
+  "fnos_version": "1.2.1010",
+  "patchset_sha256": "31abd0e7636a50e1031864f3197dffd55be73f05753b469cf3f433ea3538e7dc",
+  "kind": "correction",
+  "reason": "liveupdate.hide-kernel-entry 兼容 OTA 1.2.1010 的新 build（LiveUpdate 1.0.22）：原锚点锚在 ISO 通道的 liveupdate（6c04753f…），OTA 通道换成了另一个 build（d80a055c…）→ 真容器 no-match 而 CI 曾判 ready。改为一条补丁项 + 统一掩码 match + orig/patched 双 build 哈希列表。",
+  "author": "xlight",
+  "created_at": "2026-11-11T07:23:08Z"
+}
