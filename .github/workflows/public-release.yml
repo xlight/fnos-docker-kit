@@ -124,12 +124,16 @@ jobs:
         run: |
           set -uo pipefail
           ver="$VERSION"
+          # 取证命令自己会返回 0/2/3；**必须关掉 -e**，否则 rc=3（待基材）
+          # 会在下面分支处理之前就把 step 打死（2026-11-11 实测）。
+          set +e
           sudo python3 .github/scripts/validate_patchset.py \
             --repo "$GITHUB_WORKSPACE" --version "$ver" \
             --out "$RUNNER_TEMP/evidence-$ver.json" \
             --fingerprints "$RUNNER_TEMP/fingerprints-$ver.json" \
             --workdir "$RUNNER_TEMP/rootfs"
           rc=$?
+          set -e
           if [ "$rc" = "3" ]; then
             echo "status=unavailable" >> "$GITHUB_OUTPUT"
             echo "::warning::无可用基材（ISO 与 deb-head 都不行）→ 记待基材，每日重试"

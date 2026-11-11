@@ -58,8 +58,11 @@ def build_iso(version, out, iso_path=None, keep_iso=False):
     if not iso:
         # 官方签名 URL（裸 URL 403）——用公开的检测器取
         r = run([sys.executable, os.path.join(HERE, "check-iso-update.py"), "--signed"])
-        if r.returncode != 0:
-            log("取 ISO 签名 URL 失败: %s" % (r.stderr or r.stdout)[:200])
+        # 检测器 rc 语义：0=无变化 / 10=有新版且可下载 / 11=有新版但直链被拦 /
+        # 2=检测故障。**10/11 不是失败**（照旧判失败会让 ISO 取证路径永远"待基材"，
+        # 2026-11-11 实测）。
+        if r.returncode not in (0, 10, 11):
+            log("取 ISO 签名 URL 失败（rc=%d）: %s" % (r.returncode, (r.stderr or r.stdout)[:200]))
             return 3
         info = json.loads(r.stdout)
         cur = (info.get("current") or {})
