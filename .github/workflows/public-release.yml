@@ -173,6 +173,25 @@ jobs:
           git diff --cached --quiet || git commit -q -m "pending: $ver 缺基材，待重试"
           git push origin HEAD:main
 
+      - name: 清理待基材状态（取证成功后）
+        if: steps.val.outputs.status == 'ok'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ver="$VERSION"
+          p="state/pending/$ver.json"
+          if [ ! -f "$p" ]; then
+            echo "无待基材状态需要清理"
+            exit 0
+          fi
+          rm -f "$p"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/pending || true
+          git diff --cached --quiet || git commit -q -m "pending: $ver 基材已就绪，清除待基材状态"
+          git push origin HEAD:main
+
       - name: 上传取证产物（只作 Release 资产，**不进仓树**）
         if: steps.val.outputs.status == 'ok'
         uses: actions/upload-artifact@v4
