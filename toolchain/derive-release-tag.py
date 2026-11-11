@@ -12,6 +12,8 @@
   # stdout: v1.2.1010 或 v1.2.1010-r2
 """
 import argparse
+import hashlib
+import os
 import re
 import subprocess
 import sys
