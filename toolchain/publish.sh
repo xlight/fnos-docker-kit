@@ -195,7 +195,12 @@ except Exception:
     print(0)
 PY
 )
-  [ -n "$cur" ] && [ -n "$new" ] && [ "$new" = "$((cur + 1))" ]
+  [ -n "$cur" ] && [ -n "$new" ] || return 1
+  # 允许两种情形：
+  #   new == cur+1  索引语义变了（新增/修改补丁集、样本矩阵变化）→ 正常前进
+  #   new == cur    索引**语义未变**（只有 source_commit 指向的内容提交变了）→
+  #                 按 index_builder 的幂等规则保留旧字节，revision 不前进（不算回退/跳号）
+  [ "$new" = "$((cur + 1))" ] || [ "$new" = "$cur" ]
 }
 precheck p8
 

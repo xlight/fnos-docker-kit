@@ -93,6 +93,8 @@ jobs:
 
   # ------------------------------------------------------------------
   validate:
+    permissions:
+      contents: write
     needs: resolve
     if: needs.resolve.outputs.version != ''
     runs-on: ubuntu-22.04
@@ -141,8 +143,6 @@ jobs:
 
       - name: 记录待基材状态（无基材时）
         if: steps.val.outputs.status == 'unavailable'
-        permissions:
-          contents: write
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
