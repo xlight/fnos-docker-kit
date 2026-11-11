@@ -73,7 +73,7 @@ jobs:
               # 触发信号——只按 `fnos-<ver>.json` 提取会让"证据进仓"永远触发不了发布
               # （2026-11-11 实测：证据进仓后发布单元 10 秒就"成功"了，因为它认为没有补丁集变更）。
               ver=$(git diff --name-only "${{ github.event.before }}" "$GITHUB_SHA" -- toolchain/patches/ \
-                    | sed -n 's#.*fnos-\([0-9][0-9.]*\).*#\1#p' | sort -V | tail -1 || true)
+                    | sed -n 's#.*fnos-\([0-9][0-9.]*[0-9]\).*#\1#p' | sort -V | tail -1 || true)
             fi
           fi
           if [ -z "$ver" ]; then
