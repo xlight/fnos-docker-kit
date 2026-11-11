@@ -31,7 +31,19 @@ def list_tags(repo):
     return names
 
 
-def derive(repo, version):
+def sha256_of_tag(repo, tag, path):
+    """tag 里那份文件的 sha256（取不到返回 None）。"""
+    try:
+        p = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (tag, path)],
+                           capture_output=True)
+        if p.returncode != 0:
+            return None
+        return hashlib.sha256(p.stdout).hexdigest()
+    except Exception:
+        return None
+
+
+def derive(repo, version, patchset_file=""):
     tags = list_tags(repo)
     v = version.lstrip("Vv")
     base = "v%s" % v
@@ -42,17 +54,29 @@ def derive(repo, version):
     for t in tags:
         m = rx.match(t)
         if m:
-            revs.append(int(m.group(1)))
-    return "%s-r%d" % (base, (max(revs) + 1) if revs else 2)
+            revs.append((int(m.group(1)), t))
+    # 续跑优先：已存在且**内容与本次补丁集一致**的修订号 → 直接用它。
+    # （上次可能"建了 tag 但没发完 Release"——发布分两步（tag / 资产）不是原子的，
+    #   若一律取 max+1，那个半成品 tag 会被永远跳过、每次重试都多一个修订号。）
+    if patchset_file and os.path.isfile(patchset_file):
+        want = hashlib.sha256(open(patchset_file, "rb").read()).hexdigest()
+        rel = "toolchain/patches/" + os.path.basename(patchset_file)
+        for _, t in sorted(revs, reverse=True):
+            got = sha256_of_tag(repo, t, rel)
+            if got and got == want:
+                return t
+    return "%s-r%d" % (base, (max(n for n, _ in revs) + 1) if revs else 2)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
     ap.add_argument("--version", required=True)
+    ap.add_argument("--patchset-file", default="",
+                    help="本次补丁集路径（给了就优先续跑内容一致的既有修订号）")
     a = ap.parse_args()
     try:
-        print(derive(a.repo, a.version))
+        print(derive(a.repo, a.version, a.patchset_file))
     except Exception as e:
         print("[derive-tag] 查询失败（fail-closed，不发布）: %s" % e, file=sys.stderr)
         return 2

@@ -85,8 +85,10 @@ jobs:
           fi
           ver="${ver#V}"
           if [ -z "$tag" ]; then
-            # 修订号推导与人工旁路共用同一份实现（derive-release-tag.py）
-            tag=$(python3 toolchain/derive-release-tag.py --repo . --version "$ver") \
+            # 修订号推导与人工旁路共用同一份实现（derive-release-tag.py）；
+            # 给出补丁集路径 → 若上次"建了 tag 但没发完 Release"，优先续跑那个修订号
+            tag=$(python3 toolchain/derive-release-tag.py --repo . --version "$ver" \
+                    --patchset-file "toolchain/patches/fnos-${ver}.json") \
               || { echo "::error::tag 推导失败（fail-closed，不发布）"; exit 1; }
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
