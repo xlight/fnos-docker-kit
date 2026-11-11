@@ -28,18 +28,24 @@ def find_toolchain():
     """定位 toolchain 根目录（里面有 aobpatch.py / fnos_rootfs.py / fnos_iso.py）。
 
     脚本在私有仓是 toolchain/ci-public/validate_patchset.py，在公开仓被映射到
-    .github/scripts/validate_patchset.py —— 两种布局都要能找到 toolchain。
+    .github/scripts/validate_patchset.py —— 两种布局都要能找到 toolchain：
+      · 私有仓：向上走两层就是 toolchain/（本身含 aobpatch.py）
+      · 公开仓：.github/scripts 的**同级的上级**才有 toolchain/（<repo>/toolchain）
+    （2026-11-11 实测：定位错目录会让子进程以 rc=2 退出，被误读成"需要 root"，
+      于是 ISO 与 deb-head 两条取证路径一起落到"待基材"。）
     """
     d = HERE
-    for _ in range(5):
+    for _ in range(6):
         if os.path.isfile(os.path.join(d, "aobpatch.py")):
             return d
+        cand = os.path.join(d, "toolchain")
+        if os.path.isfile(os.path.join(cand, "aobpatch.py")):
+            return cand
         parent = os.path.dirname(d)
         if parent == d:
             break
         d = parent
-    # 兜底：公开仓里 toolchain/ 与 .github/ 平级
-    return os.path.join(os.path.dirname(HERE), "toolchain")
+    return os.path.join(os.path.dirname(os.path.dirname(HERE)), "toolchain")
 
 
 TOOLCHAIN = find_toolchain()
