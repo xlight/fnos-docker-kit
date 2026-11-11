@@ -290,6 +290,8 @@ jobs:
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           TAG: ${{ needs.resolve.outputs.tag }}
+          # 可选：公开仓 PAT（仅在 GITHUB_TOKEN 推 tag 被拒时兜底）
+          PUBLIC_REPO_TOKEN: ${{ secrets.PUBLIC_REPO_TOKEN }}
         run: |
           set -euo pipefail
           ver="$VERSION"; tag="$TAG"
@@ -311,7 +313,23 @@ jobs:
             echo "tag $tag 已存在且内容合规 → 幂等跳过（不移动）"
           else
             git tag "$tag" HEAD
-            git push origin "$tag"
+            # GITHUB_TOKEN（GitHub App）**不得**推送"含 workflow 变更"的 ref；
+            # 被拒时改用公开仓 PAT 兜底，都没有则给出可执行的人工补救（建 tag 后重跑即可，
+            # 修订号推导会优先续跑内容一致的既有 tag，不会多出修订号）。
+            if ! git push origin "$tag" 2>"$RUNNER_TEMP/tag-push.err"; then
+              if grep -qi "refusing to allow a GitHub App" "$RUNNER_TEMP/tag-push.err" \
+                 && [ -n "${PUBLIC_REPO_TOKEN:-}" ]; then
+                echo "GITHUB_TOKEN 被拒（本次提交含 workflow 变更）→ 改用公开仓 PAT"
+                git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUBLIC_REPO_TOKEN" | base64 -w0)" \
+                    push origin "$tag" \
+                  || { cat "$RUNNER_TEMP/tag-push.err"; echo "::error::PAT 兜底也失败"; exit 1; }
+              else
+                cat "$RUNNER_TEMP/tag-push.err" >&2
+                echo "::error::tag 推送被拒：若因本次提交含 .github/workflows 变更，可用 secrets.PUBLIC_REPO_TOKEN 兜底；"
+                echo "::error::或人工执行：git tag $tag <commit> && git push origin $tag，再重跑本 workflow（修订号会续跑，不会多出编号）"
+                exit 1
+              fi
+            fi
             echo "tag $tag 已创建并推送"
           fi
 
