@@ -40,6 +40,7 @@ toolchain/tests/proxy-test.py
 toolchain/tests/release-guard-test.sh
 toolchain/tests/required-files-test.py
 toolchain/tests/evidence-test.py
+toolchain/tests/release-latest-policy-test.sh
 toolchain/tests/iso-detect-test.sh
 toolchain/tests/watch-issue-test.py
 toolchain/tests/build-issue-test.py
@@ -51,6 +52,7 @@ toolchain/tests/selfheal-test.sh
 toolchain/index_builder.py
 toolchain/fnos_rootfs.py
 toolchain/release-content.sh
+toolchain/release-latest-policy.sh
 toolchain/check-release-tag.sh
 toolchain/derive-release-tag.py
 # -- scripts: 部署/存储（LXC + Docker） --

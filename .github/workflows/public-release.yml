@@ -341,8 +341,18 @@ jobs:
         run: |
           set -euo pipefail
           ver="$VERSION"; tag="$TAG"
-          gh release view "$tag" >/dev/null 2>&1 \
-            || gh release create "$tag" --title "patchset $ver" --generate-notes
+          # "Latest" 归属按 **fnOS 版本号**（不是发布时间）：GitHub 默认按日期选，
+          # 补发一个更旧的版本会把 Latest 指向旧补丁集（2026-11-12 实测）。
+          cur_latest="$(gh release view --json tagName --jq .tagName 2>/dev/null || echo '')"
+          policy="$(bash toolchain/release-latest-policy.sh "$ver" "$cur_latest")"
+          if [ "$policy" = "latest" ]; then latest_flag="--latest"; else latest_flag="--latest=false"; fi
+          log "Latest 策略：$policy（当前 Latest=${cur_latest:-<无>}，本次 $tag）"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 已存在（幂等重跑）：只在策略允许时重申 Latest 归属
+            [ "$policy" = "latest" ] && gh release edit "$tag" --latest >/dev/null 2>&1 || true
+          else
+            gh release create "$tag" --title "patchset $ver" --generate-notes "$latest_flag"
+          fi
           assets=("toolchain/patches/fnos-${ver}.json" "toolchain/patches/index.json")
           [ -f "$RUNNER_TEMP/evidence/evidence-${ver}.json" ] && assets+=("$RUNNER_TEMP/evidence/evidence-${ver}.json")
           [ -f "$RUNNER_TEMP/evidence/fingerprints-${ver}.json" ] && assets+=("$RUNNER_TEMP/evidence/fingerprints-${ver}.json")
