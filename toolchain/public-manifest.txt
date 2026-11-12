@@ -64,6 +64,8 @@ scripts/stor-mount-shim.sh
 scripts/stor-selfheal.sh
 scripts/stor-mountpoint.sh
 scripts/stor-guard.sh
+scripts/stor-usb-reattach.sh
+scripts/stor-usb-reattach-test.sh
 scripts/stor-mountpoint-test.sh
 scripts/stor-guard-test.sh
 scripts/stor-manage-docker.sh
