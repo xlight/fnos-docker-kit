@@ -62,6 +62,10 @@ scripts/stor-mountdir.sh
 scripts/stor-mask.sh
 scripts/stor-mount-shim.sh
 scripts/stor-selfheal.sh
+scripts/stor-mountpoint.sh
+scripts/stor-guard.sh
+scripts/stor-mountpoint-test.sh
+scripts/stor-guard-test.sh
 scripts/stor-manage-docker.sh
 scripts/stor-mask-docker.sh
 scripts/fnos_deploy_docker.sh
