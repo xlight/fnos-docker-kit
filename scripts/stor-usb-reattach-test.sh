@@ -19,6 +19,7 @@ bad() { FAIL=$((FAIL+1)); printf 'FAIL: %s\n' "$1"; }
 # 用独立状态目录，避免污染真实状态；事件文件也挪走
 rm -rf "$TEST_STATE"; mkdir -p "$TEST_STATE"
 export USB_STATE_DIR="$TEST_STATE"
+export USB_EVENTS_FILE="$TEST_STATE/events.jsonl"   # 测试不污染真实事件流
 # 盘身份从宿主配置读（公开集不写死序列号/标签）
 [ -f "$CONFIG" ] || { echo "缺宿主配置 $CONFIG（先跑 stor-usb-reattach.sh ensure-unit）"; exit 2; }
 . "$CONFIG"
@@ -28,7 +29,7 @@ export USB_SERIAL USB_LABEL
 bash -n "$SCRIPT" && ok "① 语法正确" || bad "① 语法错误"
 
 # ② 序列号识别（按 ID_SERIAL_SHORT，与盘符无关）
-out="$(sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" bash "$SCRIPT" check 2>&1)"
+out="$(sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" USB_EVENTS_FILE="$TEST_STATE/events.jsonl" bash "$SCRIPT" check 2>&1)"
 if printf '%s' "$out" | grep -qE "当前设备: /dev/sd[a-z]"; then ok "② 按序列号识别到当前设备"; else bad "② 未识别到设备：$(printf '%s' "$out"|head -3)"; fi
 
 # ③ 链路体检给出可执行结论
@@ -48,15 +49,14 @@ d = json.load(open(p, encoding="utf-8"))
 d["last_dev"] = "/dev/sdZZ"
 json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
-sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" bash "$SCRIPT" check >/dev/null 2>&1; rc=$?
+sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" USB_EVENTS_FILE="$TEST_STATE/events.jsonl" bash "$SCRIPT" check >/dev/null 2>&1; rc=$?
 if [ "$rc" = 1 ]; then ok "⑤ 设备名变化 → 判红（退出码 1）"; else bad "⑤ 设备名变化未判红（rc=$rc）"; fi
 
 # ⑥ apply：记事件 + 恢复（健康态：挂载 ok、容器 running）
-out="$(sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" bash "$SCRIPT" apply 2>&1)"
+out="$(sudo -n env CTID=201 USB_STATE_DIR="$TEST_STATE" USB_EVENTS_FILE="$TEST_STATE/events.jsonl" bash "$SCRIPT" apply 2>&1)"
 if printf '%s' "$out" | grep -q "检测到重枚举"; then ok "⑥ 识别到重枚举"; else bad "⑥ 未识别重枚举"; fi
 if printf '%s' "$out" | grep -q "恢复结果:"; then ok "⑥b 给出恢复结果"; else bad "⑥b 无恢复结果"; fi
-if grep -q '"cause":"usb-reattach"' "$TEST_STATE/../usb-events.jsonl" 2>/dev/null \
-   || grep -q '"cause":"usb-reattach"' /var/lib/fnos-stor/usb-events.jsonl 2>/dev/null; then
+if grep -q '"cause":"usb-reattach"' "$TEST_STATE/events.jsonl" 2>/dev/null; then
   ok "⑥c 重枚举事件已记录"
 else
   bad "⑥c 未见重枚举事件"

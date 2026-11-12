@@ -49,7 +49,7 @@ USB_ALIAS="${USB_ALIAS:-$(cfg_get USB_ALIAS)}"
 
 STATE_DIR="${USB_STATE_DIR:-/var/lib/fnos-stor/selfheal}"
 STATE_FILE="$STATE_DIR/usb-reattach-${USB_SERIAL}.json"
-EVENTS_FILE="/var/lib/fnos-stor/usb-events.jsonl"
+EVENTS_FILE="${USB_EVENTS_FILE:-/var/lib/fnos-stor/usb-events.jsonl}"
 EVENT_KEEP=200
 
 need_root
@@ -282,10 +282,16 @@ main() {
   last="$(usb_last_dev)"
 
   if [ "$CMD" = "status" ]; then
-    local tmp; tmp="$(mktemp /tmp/opencode/usb-health.XXXXXX 2>/dev/null || echo /tmp/usb-health.$$)"
-    usb_link_health > "$tmp"
-    usb_health_json "$tmp"
+    local tmp out
+    tmp="$(mktemp /tmp/opencode/usb-health.XXXXXX 2>/dev/null || echo /tmp/usb-health.$$)"
+    usb_link_health > "$tmp" 2>/dev/null
+    out="$(usb_health_json "$tmp" 2>/dev/null)"
     rm -f "$tmp"
+    # 兜底：消费方（TUI）按 JSON 解析，输出必须始终是合法 JSON
+    case "$out" in
+      '{'*) printf '%s\n' "$out";;
+      *)   printf '{"serial":"%s","healthy":false,"summary":"体检输出异常","reattach_count":0,"last_event":null}\n' "$USB_SERIAL";;
+    esac
     exit 0
   fi
 
