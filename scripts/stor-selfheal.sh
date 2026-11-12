@@ -31,8 +31,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTID="${CTID:-}"
 CMD="${1:-check}"
 DRY=0
-[ "${2:-}" = "--dry-run" ] && DRY=1
-[ -n "$CTID" ] || { echo "用法: CTID=<id> bash $0 check|repair [--dry-run]" >&2; exit 2; }
+JSON_MODE=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1;;
+    --json)    JSON_MODE=1;;
+  esac
+done
+[ -n "$CTID" ] || { echo "用法: CTID=<id> bash $0 check|repair [--dry-run] [--json]" >&2; exit 2; }
 
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -44,10 +50,37 @@ MASK="/var/lib/lxc/${CTID}/sysblock"
 CONF="/etc/pve/lxc/${CTID}.conf"
 STACK_STATE="/var/lib/fnos-stor/ct${CTID}.env"
 
-log()  { printf '[selfheal] %s\n' "$*"; }
-ok()   { printf '  OK    %s\n' "$*"; }
-bad()  { printf '  FAIL  %s\n' "$*"; }
-warn() { printf '  WARN  %s\n' "$*"; }
+log()  { if [ "$JSON_MODE" = 1 ]; then printf '[selfheal] %s\n' "$*" >&2; else printf '[selfheal] %s\n' "$*"; fi; }
+ok()   { if [ "$JSON_MODE" = 1 ]; then printf '  OK    %s\n' "$*" >&2; else printf '  OK    %s\n' "$*"; fi; RESULTS+=("$(printf '%s\tok\t%s' "$CHECK_NAME" "$*")"); }
+bad()  { if [ "$JSON_MODE" = 1 ]; then printf '  FAIL  %s\n' "$*" >&2; else printf '  FAIL  %s\n' "$*"; fi; RESULTS+=("$(printf '%s\tbad\t%s' "$CHECK_NAME" "$*")"); }
+warn() { if [ "$JSON_MODE" = 1 ]; then printf '  WARN  %s\n' "$*" >&2; else printf '  WARN  %s\n' "$*"; fi; RESULTS+=("$(printf '%s\twarn\t%s' "$CHECK_NAME" "$*")"); }
+
+# 逐项检查结论的机器可读汇总（--json 时 stdout 只有 JSON，人读日志走 stderr）
+CHECK_NAME="-"
+RESULTS=()
+STATUS_FILE="$STATE_DIR/status-ct${CTID}.json"
+emit_status_json() { # <healthy:0|1>
+  python3 - "$CTID" "$1" "$STATUS_FILE" "${RESULTS[@]}" <<'PY'
+import datetime, json, os, sys
+ctid, healthy, path = sys.argv[1], sys.argv[2] == "1", sys.argv[3]
+checks = []
+for line in sys.argv[4:]:
+    parts = line.split("\t")
+    if len(parts) == 3:
+        checks.append({"name": parts[0], "level": parts[1], "detail": parts[2]})
+doc = {"ctid": int(ctid), "healthy": healthy,
+       "checked_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "checks": checks,
+       "summary": ("全部检查通过" if healthy else "存在 %d 项不健康" % sum(1 for c in checks if c["level"] == "bad"))}
+try:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+except OSError:
+    pass
+print(json.dumps(doc, ensure_ascii=False, indent=2))
+PY
+}
 
 ct_running() { pct status "$CTID" 2>/dev/null | grep -q running; }
 ct_shm()     { pct exec "$CTID" -- sh -c "$1" 2>/dev/null; }
@@ -213,21 +246,23 @@ main() {
   [ "$CMD" = "repair" ] && ensure_unit
 
   local rc_stack=0 rc_conf=0 rc_mask=0 rc_nodes=0 rc_mounts=0
-  chk_stack   || rc_stack=1
-  chk_conf    || rc_conf=1
-  chk_mask    || rc_mask=1
-  chk_nodes   || rc_nodes=1
-  chk_mounts  || rc_mounts=1
+  CHECK_NAME=stack;   chk_stack   || rc_stack=1
+  CHECK_NAME=conf;    chk_conf    || rc_conf=1
+  CHECK_NAME=mask;    chk_mask    || rc_mask=1
+  CHECK_NAME=nodes;   chk_nodes   || rc_nodes=1
+  CHECK_NAME=mounts;  chk_mounts  || rc_mounts=1
 
   local bad_count=$((rc_stack+rc_conf+rc_mask+rc_nodes+rc_mounts))
   if [ "$bad_count" = 0 ]; then
     log "全部检查通过，无需修复"
     manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-check","ctid":%s,"result":"healthy"}' "$(date -Is)" "$CTID")"
+    [ "$JSON_MODE" = 1 ] && emit_status_json 1
     exit 0
   fi
   log "发现 $bad_count 项不健康"
   if [ "$CMD" = "check" ]; then
     manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-check","ctid":%s,"result":"unhealthy","items":%s}' "$(date -Is)" "$CTID" "$bad_count")"
+    [ "$JSON_MODE" = 1 ] && emit_status_json 0
     exit 1
   fi
 
