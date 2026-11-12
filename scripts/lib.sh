@@ -30,6 +30,13 @@ FNOS_DID="${FNOS_DID:-c0ffee00-0000-4000-8000-000000000001}"
 _caller="${SUDO_USER:-${USER:-root}}"
 _caller_home="$(getent passwd "$_caller" 2>/dev/null | cut -d: -f6)"; [ -n "$_caller_home" ] || _caller_home="$HOME"
 HOST_BACKUP_ROOT="${HOST_BACKUP_ROOT:-$_caller_home/fnos/backups}"
+# systemd 单元里跑时没有 SUDO_USER（USER=root）→ 审计会落进 /root/fnos/backups，
+# 与人工操作的审计**分叉**（rollback 只读项目内那份 → 定时动作漏撤）。
+# 单元化机制（自愈/存活巡检/USB timer）一律写项目内这份。
+_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+if [ -z "${SUDO_USER:-}" ] && [ "$(id -u)" = 0 ] && [ -d "$_repo_root/backups" ]; then
+  HOST_BACKUP_ROOT="$_repo_root/backups"
+fi
 CT_BACKUP_ROOT="${CT_BACKUP_ROOT:-/root/fnos-net-backup}"
 MANIFEST="${MANIFEST:-$HOST_BACKUP_ROOT/manifest.jsonl}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
