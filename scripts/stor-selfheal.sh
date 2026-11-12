@@ -166,18 +166,57 @@ chk_mask() { # 掩码视图：条目在、软链不悬空、组件分区在
     t="$(readlink -f "$MASK/$e" 2>/dev/null)"
     if [ -z "$t" ] || [ ! -e "$t" ]; then bad "掩码条目悬空: $e"; rc=1; fi
   done < <(ls "$MASK" 2>/dev/null | grep -v '^\.README$')
-  # md 的组件分区必须在视图里（fnOS 判 md 健康要找它）
+  # md 的组件必须可见：独立条目，**或**经其父盘的 sysfs 子树可达（父盘暴露即可）
   local comp cn
   comp="$(sed -n 's/^MD_DEV=//p' "$STACK_STATE" | xargs -r -I{} basename {} 2>/dev/null)"
   if [ -n "$comp" ]; then
     for c in /sys/block/"$comp"/slaves/*; do
       [ -e "$c" ] || continue
       cn="$(basename "$c")"
-      [ -L "$MASK/$cn" ] || { bad "掩码缺组件盘: $cn（fnOS 会判 arrayState=broken）"; rc=1; }
+      local cparent pname
+      cparent="$(dirname "$(readlink -f "$c" 2>/dev/null)" 2>/dev/null)"
+      pname="$(basename "$cparent" 2>/dev/null)"
+      if [ ! -L "$MASK/$cn" ] && [ -z "$pname" -o ! -L "$MASK/$pname" ]; then
+        bad "掩码缺组件盘: $cn（fnOS 会判 arrayState=broken）"; rc=1
+      fi
     done
   fi
-  [ "$rc" = 0 ] && ok "掩码视图完整（无悬空、组件在）"
+  # **分区不得单独暴露**：fnOS 的磁盘清单按"名字以 sd 开头"收集 /sys/block 条目，
+  # 单独暴露的分区会被当成第二块盘 → 同一块物理盘在存储视图里出现两次（2026-11-12 实测）。
+  # 判定不靠名字（dm-2/md126/nvme1n1 都带数字，但不是分区），而看 sysfs 形态：
+  # 分区的路径形如 .../block/<整盘>/<分区>（比整盘多一层）。
+  for e in $(ls "$MASK" 2>/dev/null | grep -v '^\.README$'); do
+    local mtgt; mtgt="$(readlink -f "$MASK/$e" 2>/dev/null)"
+    case "$mtgt" in
+      */block/*/*) bad "掩码含分区独立条目: $e（会被 fnOS 当成第二块盘）"; rc=1;;
+    esac
+  done
+  [ "$rc" = 0 ] && ok "掩码视图完整（无悬空、组件在、无分区独立条目）"
   return $rc
+}
+
+chk_component() { # (l) md 组件的父盘必须能被 fnOS 识别为"盘"
+  # 后端存储（zvol）没有盘身份（无 ID_MODEL/ID_SERIAL）→ fnOS 的数组视图里没有组件盘
+  # → 界面显示「缺失 disk 状态」（2026-11-12 实测）。
+  local md comp parent
+  md="$(sed -n 's/^MD_DEV=//p' "$STACK_STATE" 2>/dev/null)"
+  [ -n "$md" ] || { bad "无 md 设备信息（$STACK_STATE）"; return 1; }
+  local mdb; mdb="$(basename "$(readlink -f "$md" 2>/dev/null)" 2>/dev/null)"
+  [ -n "$mdb" ] || { bad "md 设备不存在: $md"; return 1; }
+  comp="$(ls /sys/block/"$mdb"/slaves/ 2>/dev/null | head -1)"
+  [ -n "$comp" ] || { bad "md $mdb 没有组件（slaves 为空）"; return 1; }
+  case "$comp" in
+    *p[0-9]) parent="${comp%p[0-9]*}";;
+    *[0-9])  parent="${comp%%[0-9]*}";;
+    *)       parent="$comp";;
+  esac
+  if [ -e "/sys/block/$parent/device" ] \
+     && { [ -s "/sys/block/$parent/device/model" ] || [ -s "/sys/block/$parent/device/serial" ]; }; then
+    ok "md $mdb 组件 $comp 的父盘 $parent 有盘身份（fnOS 可识别）"
+    return 0
+  fi
+  bad "md $mdb 组件 $comp 的父盘 $parent 无盘身份（fnOS 会显示「缺失 disk 状态」）"
+  return 1
 }
 
 chk_nodes() { # 容器 /dev 节点覆盖掩码视图
@@ -262,6 +301,44 @@ fix_start() { # 拉起并记账（与重启共用预算）
   return 0
 }
 
+budget_guard() { # 只做预算判定（冷却期 + 24h 次数），不动作
+  local last now
+  last="$(cat "$RESTART_STATE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if [ $((now - last)) -lt "$COOLDOWN" ]; then
+    warn "冷却期内（$((COOLDOWN/60)) 分钟内已动过容器），本轮不动作"
+    return 1
+  fi
+  # 24h 内最多 2 次自动动作：修不好就交给人，别自己变成故障源
+  local budget=0 old
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    [ $((now - old)) -lt 86400 ] && budget=$((budget+1))
+  done < <(cat "$STATE_DIR/ct${CTID}.restarts" 2>/dev/null)
+  if [ "$budget" -ge 2 ]; then
+    warn "24h 内已自动动过容器 ${budget} 次（预算上限），本轮不再动作——需要人工介入"
+    return 1
+  fi
+  return 0
+}
+
+fix_component() { # md 成员被后端存储抢走 → 停容器 → 重放 stor-manage up（重装配）→ 起容器
+  [ "${SELFHEAL_NO_RESTART:-0}" = "1" ] && { warn "按 SELFHEAL_NO_RESTART=1 跳过自动纠正"; return 1; }
+  budget_guard || return 1
+  log "修复：纠正 md 成员（停容器 → 重放 stor-manage up 重装配 → 起容器）"
+  local now; now="$(date +%s)"
+  if ct_running; then
+    pct stop "$CTID" >/dev/null 2>&1
+    log "已停容器（释放卷占用）"
+  fi
+  CTID="$CTID" bash "$SCRIPT_DIR/stor-manage.sh" up >/dev/null 2>&1
+  pct start "$CTID" >/dev/null 2>&1
+  echo "$now" > "$RESTART_STATE"
+  echo "$now" >> "$STATE_DIR/ct${CTID}.restarts"
+  manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-fix-component","ctid":%s,"result":"attempted"}' "$(date -Is)" "$CTID")"
+  return 0
+}
+
 restart_guard() { # 防抖：冷却期 + 24h 预算（防抖是为了不反复重启同一台容器）
   [ "${SELFHEAL_NO_RESTART:-0}" = "1" ] && { warn "按 SELFHEAL_NO_RESTART=1 跳过自动重启"; return 1; }
   local last now
@@ -325,16 +402,17 @@ main() {
   log "== stor-selfheal $CMD (CT$CTID) =="
   [ "$CMD" = "repair" ] && ensure_unit
 
-  local rc_ct=0 rc_mp=0 rc_stack=0 rc_conf=0 rc_mask=0 rc_nodes=0 rc_mounts=0
+  local rc_ct=0 rc_mp=0 rc_stack=0 rc_conf=0 rc_mask=0 rc_nodes=0 rc_mounts=0 rc_comp=0
   CHECK_NAME=ct;         chk_ct         || rc_ct=1
   CHECK_NAME=mountpoints; chk_mountpoints || rc_mp=1
   CHECK_NAME=stack;      chk_stack      || rc_stack=1
   CHECK_NAME=conf;       chk_conf       || rc_conf=1
   CHECK_NAME=mask;       chk_mask       || rc_mask=1
+  CHECK_NAME=component;  chk_component  || rc_comp=1
   CHECK_NAME=nodes;      chk_nodes      || rc_nodes=1
   CHECK_NAME=mounts;     chk_mounts     || rc_mounts=1
 
-  local bad_count=$((rc_ct+rc_mp+rc_stack+rc_conf+rc_mask+rc_nodes+rc_mounts))
+  local bad_count=$((rc_ct+rc_mp+rc_stack+rc_conf+rc_mask+rc_nodes+rc_mounts+rc_comp))
   if [ "$bad_count" = 0 ]; then
     log "全部检查通过，无需修复"
     manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-check","ctid":%s,"result":"healthy"}' "$(date -Is)" "$CTID")"
@@ -357,12 +435,17 @@ main() {
   [ "$rc_stack" = 1 ]  && fix_stack
   [ "$rc_conf" = 1 ]   && fix_conf
   [ "$rc_mask" = 1 ]   && fix_mask
+  # md 成员被后端存储抢走 → 停容器重装配（自身会重启容器，随后不再重复重启）
+  if [ "$rc_comp" = 1 ]; then
+    if fix_component; then COMP_FIXED=1; fi
+  fi
   [ "$rc_nodes" = 1 ]  && fix_nodes
   # 容器停机 → 拉起（不是重启）；挂载/放行/掩码问题 → 重启才生效
   if [ "$rc_ct" = 1 ]; then
     if start_guard; then fix_start; STARTED=1; fi
   fi
-  if { [ "$rc_mounts" = 1 ] || [ "$rc_conf" = 1 ] || [ "$rc_mask" = 1 ]; } && ct_running; then
+  if { [ "$rc_mounts" = 1 ] || [ "$rc_conf" = 1 ] || [ "$rc_mask" = 1 ]; } && ct_running \
+     && [ -z "${COMP_FIXED:-}" ]; then
     if restart_guard; then RESTARTED=1; fi
   fi
 
@@ -395,6 +478,7 @@ main() {
   chk_stack      || again=1
   chk_conf       || again=1
   chk_mask       || again=1
+  chk_component  || again=1
   chk_nodes      || again=1
   chk_mounts     || again=1
   if [ "$again" = 0 ]; then

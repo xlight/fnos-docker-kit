@@ -109,7 +109,82 @@ ensure_nvme() {
   log "NVMe 盘 = /dev/$NVME_DEV (nqn=$NQN)"
 }
 
+# ---------- 宿主侧：阻止后端 zvol 参与 md 自动装配 ----------
+# 为什么（2026-11-12 实测）：宿主 md 自动装配（64-md-raid-assembly.rules → mdadm --incremental）
+# 会在开机时把**后端存储（zvol）的分区**抢作数组成员 —— zfs 导入早于 nvme-loop 连接。
+# 两个视图是同一份字节（loop 视图 = zvol 的往返视图），但 **zvol 没有盘身份**
+# （udev 只有 DEVTYPE=disk，无 ID_MODEL/ID_SERIAL）→ fnOS 认不出组件盘
+# → 存储界面显示「缺失 disk 状态」。
+# 办法：让 zvol 的分区**不参与** md 自动装配（该规则只匹配 ID_FS_TYPE=linux_raid_member），
+# 数组成员改由**物化设备**（nvme-loop）的分区装配 —— 它有盘身份，fnOS 认得。
+ensure_md_autoassembly_guard() {
+  local R="/etc/udev/rules.d/63-fnosskip-zvol-md.rules"
+  cat > "$R" <<'EOF'
+# 63-fnosskip-zvol-md.rules —— 后端存储（zvol）的分区**不参与** md 自动装配
+#
+# 背景（2026-11-12 实测）：物化设备（nvme-loop）与后端 zvol 是同一份字节，
+# 宿主 md 自动装配会抢到 zvol 的分区 → zvol 无盘身份 → fnOS 认不出组件盘
+# → 存储界面「缺失 disk 状态」。让 zvol 分区退出自动装配，数组改由物化设备装配。
+# 生效顺序：本文件在 60-block.rules（blkid builtin 写 ID_FS_TYPE）之后、
+# 64-md-raid-assembly.rules（按 ID_FS_TYPE=linux_raid_member 触发）之前。
+SUBSYSTEM=="block", KERNEL=="zd*p[0-9]*", ENV{ID_FS_TYPE}=="linux_raid_member", ENV{ID_FS_TYPE}="zvol_raid_member"
+EOF
+  udevadm control --reload-rules 2>/dev/null
+  log "已安装 zvol 退出 md 自动装配规则：$R"
+}
+
 # ---------- 3) partition + md + LVM + ext4（fnOS 配方）----------
+# md 当前成员（slaves 里那个设备名）；取不到则空
+md_slave_name() { # $1=md 设备路径
+  local md="$1" base s
+  base="$(basename "$(readlink -f "$md" 2>/dev/null)" 2>/dev/null)"
+  [ -n "$base" ] || return 1
+  for s in /sys/block/"$base"/slaves/*; do
+    [ -e "$s" ] || continue
+    basename "$s"; return 0
+  done
+  return 1
+}
+
+# 逻辑卷是否正被容器使用（容器内的挂载在宿主 /proc/mounts 里看不到 → 必须进容器查）
+vol_in_use() { # $1=DM 设备（如 /dev/trim_xxx/0）$2=挂载点（如 /vol2）
+  local dm="$1" mp="$2"
+  [ -n "$mp" ] || return 1
+  pct exec "$CTID" -- sh -c "grep -q ' $mp ' /proc/mounts" 2>/dev/null && return 0
+  findmnt -n -o TARGET -S "$dm" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# 重装配 md 到指定成员（显式给成员 → 不会被后端 zvol 的分区抢走；数据零迁移：
+# 两个视图是同一份字节，实测超级块区与首块 md5 一致）
+fix_md_member() { # $1=md 设备  $2=期望成员分区
+  local md="$1" part="$2" mp="/vol${DEVID:-2}"
+  if vol_in_use "$DM_DEV" "$mp"; then
+    warn "卷 $mp 正被容器使用，拒绝重装配 md（需先停容器再重放 up）"
+    return 1
+  fi
+  log "重装配 md：停 VG → 停 md → 用 $part 重新装配 → 起 VG"
+  vgchange -an "$VG" >/dev/null 2>&1
+  mdadm --stop "$md" >/dev/null 2>&1 || true
+  local ok=0
+  if [ -x "$FNO_MDADM" ] && "$FNO_MDADM" --assemble "$md" --run "$part" >/dev/null 2>&1; then ok=1; fi
+  [ "$ok" = 0 ] && mdadm --assemble "$md" --run "$part" >/dev/null 2>&1 && ok=1
+  if [ "$ok" != 1 ]; then
+    warn "md 重新装配失败（成员 $part）"
+    vgchange -ay "$VG" >/dev/null 2>&1
+    return 1
+  fi
+  vgchange -ay "$VG" >/dev/null 2>&1
+  local now; now="$(md_slave_name "$md" || true)"
+  if [ "$now" = "$(basename "$part")" ]; then
+    log "md 已重装配到 $now ✓"
+    manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"md-reassemble","ctid":%s,"vg":"%s","member":"%s","result":"ok"}' "$(date -Is)" "$CTID" "$VG" "$now")"
+    return 0
+  fi
+  warn "md 重装配后成员为 ${now:-?}，非期望值"
+  return 1
+}
+
 ensure_stack() {
   load_state
   local vg="${VG:-}"
@@ -130,7 +205,20 @@ ensure_stack() {
   if vgs "$VG" >/dev/null 2>&1; then
     MD_DEV="$(pvs --noheadings -o pv_name --select "vg_name=$VG" 2>/dev/null | tr -d ' ')"
     DM_DEV="/dev/${VG}/0"
-    log "栈已存在：VG=$VG PV=$MD_DEV"
+    # 核对 md 成员：必须是**物化设备**（nvme-loop）上的分区。
+    # 宿主 md 自动装配（64-md-raid-assembly.rules → mdadm --incremental）会抢走
+    # **后端存储（zvol）的分区** —— 两者是同一份字节（loop 视图 = zvol 的往返视图），
+    # 但 zvol 没有盘身份 → fnOS 认不出组件盘 → 界面「缺失 disk 状态」（2026-11-12 实测）。
+    # 这里在每次启动核对，偏差即重装配（幂等；卷被容器占用时拒绝并说明）。
+    local cur_memb want_memb
+    cur_memb="$(md_slave_name "$MD_DEV" || true)"
+    want_memb="$(basename "$NVME_PART")"
+    if [ -n "$cur_memb" ] && [ "$cur_memb" != "$want_memb" ]; then
+      log "md 成员偏差：当前 $cur_memb，应为 $want_memb（物化设备分区）"
+      fix_md_member "$MD_DEV" "$NVME_PART" || warn "md 成员未纠正（需先停容器再重放 up）"
+      cur_memb="$(md_slave_name "$MD_DEV" || true)"   # 纠正后重读，避免日志留旧值
+    fi
+    log "栈已存在：VG=$VG PV=$MD_DEV 成员=${cur_memb:-?}"
     save_state "UUID=${UUID:-}" "VG=$VG" "MD_DEV=$MD_DEV" "DM_DEV=$DM_DEV" "NQN=$NQN" "VOLSTORE=$VOLSTORE" "VOLNAME=$VOLNAME" "VOLFS=$VOLFS"
     return
   fi
@@ -264,16 +352,28 @@ ensure_mask() {
   done
   DEVS="${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}" bash "$SCRIPT_DIR/stor-mask.sh" apply >/dev/null 2>&1 \
     && log "已应用 /sys/block 屏蔽（${NVME_DEV} ${mdn} ${dmn} ${EXTRA_DEVS:-}）"
-  # 组件盘（md 的 slaves）常是**分区**（如 zd0p1），不在 /sys/block/<name> 下，
-  # 掩码脚本的裸名逻辑会跳过 → 这里按真实路径显式建软链（含其父盘）。
+  # 组件分区**不单独**暴露（2026-11-12 实测修正）：fnOS 的磁盘清单按"名字以 sd 开头"
+  # 收集 /sys/block 条目，单独暴露的分区会被当成**第二块盘** → 同一块盘出现两次。
+  # 组件分区可经其**父盘**的 sysfs 子树访问，父盘必须暴露（fnOS 按父盘解析组件）。
   local cbase ctgt
   for cbase in $comps; do
     ctgt="$(readlink -f "/sys/block/${mdn}/slaves/${cbase}" 2>/dev/null)"
     [ -n "$ctgt" ] && [ -e "$ctgt" ] || continue
-    ln -sfn "$ctgt" "$MASK/$cbase" && log "掩码暴露组件: $cbase"
+    if [ -L "$MASK/$cbase" ]; then
+      rm -f "$MASK/$cbase" && log "清理组件分区独立条目: $cbase"
+    fi
     local cparent; cparent="$(dirname "$ctgt")"
     [ -e "$cparent" ] || continue
     ln -sfn "$cparent" "$MASK/$(basename "$cparent")" && log "掩码暴露组件父盘: $(basename "$cparent")"
+  done
+  # 后端存储（zvol）**不是**直通集合的一部分：它的分区与物化设备同源字节但**无盘身份**，
+  # 暴露出去只会让 fnOS 多看到一块"认不出身份"的设备。清理历史条目。
+  local me
+  for me in $(ls "$MASK" 2>/dev/null | grep -v '^\.README$'); do
+    local mtgt; mtgt="$(readlink -f "$MASK/$me" 2>/dev/null)"
+    case "$mtgt" in
+      */block/zd*|*/block/zd*/*) rm -f "$MASK/$me" && log "清理后端存储条目（无盘身份）: $me";;
+    esac
   done
 }
 
@@ -382,7 +482,7 @@ do_create() {
   need_root; need_py; need_ct
   load_state
   log "== stor-manage create (CT$CTID) =="
-  ensure_zvol; ensure_nvme; ensure_stack; ensure_passthrough; ensure_mask; ensure_zfs_mount; do_register; ensure_appmeta; ensure_unit
+  ensure_zvol; ensure_nvme; ensure_stack; ensure_passthrough; ensure_mask; ensure_zfs_mount; do_register; ensure_appmeta; ensure_unit; ensure_md_autoassembly_guard
   manifest_add "$(printf '{"ts":"%s","script":"stor-manage","action":"create","ctid":%s,"vg":"%s","md":"%s","lv":"%s"}' "$(date -Is)" "$CTID" "${VG:-}" "${MD_DEV:-}" "${DM_DEV:-}")"
   log "create 完成；重启容器生效：pct reboot $CTID"
 }
@@ -395,6 +495,7 @@ do_up() {   # 自愈：确保 zvol/nvme/栈/透传/屏蔽/自身 unit 都在（�
   ( ensure_passthrough ) || warn "透传确保未完成（state 或容器状态异常，详见上方日志）"
   ensure_mask  || true
   ensure_unit  || true
+  ensure_md_autoassembly_guard || true
   log "up 完成"
 }
 # ---------- 0) destroy 护栏：卷上有应用数据时默认拒绝 ----------
