@@ -184,16 +184,12 @@ usb_link_health() { # 输出 TSV：key<TAB>value
   printf 'advice\t%s\n' "$advice"
 }
 
-usb_health_json() { # $1 = 体检 TSV 文件
+usb_health_json() { # $1 = 体检 TSV 文本（走 argv，不依赖 stdin/临时文件）
   python3 - "$STATE_FILE" "$USB_SERIAL" "$EVENTS_FILE" "$1" <<'PY'
 import datetime, json, os, sys
-state_path, serial, events_path, health_path = sys.argv[1:5]
+state_path, serial, events_path, health_text = sys.argv[1:5]
 health = {}
-try:
-    lines = open(health_path, encoding="utf-8").read().splitlines()
-except Exception:
-    lines = []
-for line in lines:
+for line in health_text.splitlines():
     if "\t" in line:
         k, v = line.split("\t", 1)
         health[k] = v
@@ -282,11 +278,9 @@ main() {
   last="$(usb_last_dev)"
 
   if [ "$CMD" = "status" ]; then
-    local tmp out
-    tmp="$(mktemp /tmp/opencode/usb-health.XXXXXX 2>/dev/null || echo /tmp/usb-health.$$)"
-    usb_link_health > "$tmp" 2>/dev/null
-    out="$(usb_health_json "$tmp" 2>/dev/null)"
-    rm -f "$tmp"
+    local out health
+    health="$(usb_link_health 2>/dev/null)"
+    out="$(usb_health_json "$health" 2>/dev/null)"
     # 兜底：消费方（TUI）按 JSON 解析，输出必须始终是合法 JSON
     case "$out" in
       '{'*) printf '%s\n' "$out";;
