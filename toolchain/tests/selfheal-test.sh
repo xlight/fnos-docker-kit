@@ -57,7 +57,7 @@ else
 fi
 
 # ---- 新脚本也要过公开侧的语法/路径门槛 ----
-for extra in stor-mountpoint.sh stor-guard.sh; do
+for extra in stor-mountpoint.sh stor-guard.sh stor-usb-reattach.sh; do
   escript="$TC/../scripts/$extra"
   if [ ! -f "$escript" ]; then bad "缺脚本：$extra"; continue; fi
   bash -n "$escript" && ok "语法正确：$extra" || bad "语法错误：$extra"
@@ -67,6 +67,26 @@ for extra in stor-mountpoint.sh stor-guard.sh; do
     ok "无宿主私有绝对路径：$extra"
   fi
 done
+
+# ---- 组件盘可见性相关机制必须在位（2026-11-12/14 实测缺陷的回归）----
+MANAGE="$TC/../scripts/stor-manage.sh"
+LIB="$TC/../scripts/lib.sh"
+for pat in "chk_component" "fix_component" "component_parent" "action_lock_acquire" \
+           "wait_container_settle" "component-fixes"; do
+  if grep -q "$pat" "$SCRIPT"; then ok "自愈含组件盘机制：$pat"; else bad "自愈缺组件盘机制：$pat"; fi
+done
+for pat in "fix_md_member" "assemble_md" "ensure_md_autoassembly_guard" "FNO_MDADM"; do
+  if grep -q "$pat" "$MANAGE"; then ok "栈脚本含成员纠正机制：$pat"; else bad "栈脚本缺成员纠正机制：$pat"; fi
+done
+for pat in "action_lock_acquire" "action_lock_release"; do
+  if grep -q "$pat" "$LIB"; then ok "lib 含互斥锁：$pat"; else bad "lib 缺互斥锁：$pat"; fi
+done
+if [ -f "$TC/../scripts/stor-selfheal-component-test.sh" ]; then
+  bash -n "$TC/../scripts/stor-selfheal-component-test.sh" \
+    && ok "组件盘回归测试脚本语法正确" || bad "组件盘回归测试脚本语法错误"
+else
+  bad "缺组件盘回归测试脚本"
+fi
 for pat in "mp_source_is_stale" "mp_same_dev" "mountpoint-status.json" "期望运行状态\|expect" "start_budget_ok"; do
   if grep -Rq "$pat" "$TC/../scripts/stor-mountpoint.sh" "$TC/../scripts/stor-guard.sh"; then
     ok "新机制含判据：$pat"

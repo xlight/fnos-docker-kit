@@ -196,7 +196,11 @@ main() {
 
   # ② 容器没跑且期望为 running → 拉起（受预算约束）
   if [ "$running" = 0 ] && [ "$expect" = "running" ]; then
-    if start_budget_ok; then
+    # 与自愈修复互斥：自愈正在停容器重装配时，不能把容器拉起来打断它
+    if ! action_lock_acquire "$CTID" 0; then
+      summary="另一破坏性动作在跑（自愈修复中），本轮不拉起"
+      log "$summary"
+    elif start_budget_ok; then
       log "拉起容器：pct start $CTID"
       pct start "$CTID" >/dev/null 2>&1
       echo "$(date +%s)" >> "$START_LOG"
@@ -214,6 +218,7 @@ main() {
         log "拉起未成功：$summary"
         manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"guard-start","ctid":%s,"result":"failed","waited":%s}' "$(date -Is)" "$CTID" "$waited")"
       fi
+      action_lock_release
     else
       summary="容器未运行，拉起被预算/冷却抑制"
     fi

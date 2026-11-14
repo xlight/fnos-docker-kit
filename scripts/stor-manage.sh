@@ -133,6 +133,15 @@ EOF
   log "已安装 zvol 退出 md 自动装配规则：$R"
 }
 
+# 重新装配 md（显式成员 → 不会被后端 zvol 的分区抢走）
+# 注意：**必须用 fnOS 自带的 mdadm**（$FNO_MDADM）：宿主 mdadm 4.4 装不了这个数组
+# （实测 "Unable to initialize sysfs"），而 fnOS 的那份可以 ✓（它也是当初建阵的同一个）。
+assemble_md() { # $1=成员分区路径
+  local part="$1" md="/dev/md126"
+  [ -x "$FNO_MDADM" ] || { warn "缺 fnOS mdadm 缓存 $FNO_MDADM"; return 1; }
+  "$FNO_MDADM" --assemble "$md" --run "$part" >/dev/null 2>&1
+}
+
 # ---------- 3) partition + md + LVM + ext4（fnOS 配方）----------
 # md 当前成员（slaves 里那个设备名）；取不到则空
 md_slave_name() { # $1=md 设备路径
@@ -167,8 +176,11 @@ fix_md_member() { # $1=md 设备  $2=期望成员分区
   vgchange -an "$VG" >/dev/null 2>&1
   mdadm --stop "$md" >/dev/null 2>&1 || true
   local ok=0
-  if [ -x "$FNO_MDADM" ] && "$FNO_MDADM" --assemble "$md" --run "$part" >/dev/null 2>&1; then ok=1; fi
-  [ "$ok" = 0 ] && mdadm --assemble "$md" --run "$part" >/dev/null 2>&1 && ok=1
+  if assemble_md "$part"; then ok=1; fi
+  if [ "$ok" != 1 ]; then
+    # 兜底：宿主 mdadm（实测对本数组会报 "Unable to initialize sysfs"，仅作尝试）
+    mdadm --assemble "$md" --run "$part" >/dev/null 2>&1 && ok=1
+  fi
   if [ "$ok" != 1 ]; then
     warn "md 重新装配失败（成员 $part）"
     vgchange -ay "$VG" >/dev/null 2>&1
@@ -221,6 +233,26 @@ ensure_stack() {
     log "栈已存在：VG=$VG PV=$MD_DEV 成员=${cur_memb:-?}"
     save_state "UUID=${UUID:-}" "VG=$VG" "MD_DEV=$MD_DEV" "DM_DEV=$DM_DEV" "NQN=$NQN" "VOLSTORE=$VOLSTORE" "VOLNAME=$VOLNAME" "VOLFS=$VOLFS"
     return
+  fi
+  # VG 不在，但成员设备上**还有 md 超级块** → 阵列只是没装配起来（md 被停了/没起来），
+  # **数据仍在成员设备上**（超级块、VG 元数据、LV 数据都在同一份字节里）→
+  # 重新装配即可恢复，**绝不能走新建路径**（那会 wipefs 掉数据）。
+  if mdadm --examine "$NVME_PART" >/dev/null 2>&1; then
+    log "VG=$VG 不存在，但 $NVME_PART 上仍有 md 超级块 → 重新装配（数据不迁移）"
+    if assemble_md "$NVME_PART"; then
+      vgchange -ay "$VG" >/dev/null 2>&1
+      MD_DEV="$(pvs --noheadings -o pv_name --select "vg_name=$VG" 2>/dev/null | tr -d ' ')"
+      DM_DEV="/dev/${VG}/0"
+      if vgs "$VG" >/dev/null 2>&1; then
+        log "已重新装配并恢复 VG：PV=$MD_DEV 成员=$(md_slave_name "$MD_DEV" || echo '?')"
+        save_state "UUID=${UUID:-}" "VG=$VG" "MD_DEV=$MD_DEV" "DM_DEV=$DM_DEV" "NQN=$NQN" "VOLSTORE=$VOLSTORE" "VOLNAME=$VOLNAME" "VOLFS=$VOLFS"
+        return
+      fi
+      warn "md 已装配但 VG 仍未出现"
+    else
+      warn "md 重新装配失败"
+    fi
+    return 1
   fi
   # 分区
   wipefs -a "/dev/$NVME_DEV" >/dev/null 2>&1 || true

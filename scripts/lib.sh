@@ -105,6 +105,28 @@ manifest_add() {  # $1 = JSON 对象字符串（必须合法 JSON，否则拒绝
   )
 }
 
+# ---------- 破坏性动作互斥锁 ----------
+# 为什么需要：存活巡检（stor-guard）与自愈修复（stor-selfheal）都可能动容器 ——
+# 自愈正在"停容器 → 重装配 md → 起容器"时，存活巡检若同时把容器拉起来，
+# 会打断修复（卷仍被占用 → 重装配失败），甚至把半装配状态暴露给 fnOS。
+# 约定：任何会停/起容器的动作都必须持锁；拿不到锁就**跳过**（不排队、不硬闯）。
+ACTION_LOCK_FD=""
+action_lock_acquire() { # $1=ctid  $2=等待秒（0=不等）
+  local ctid="$1" wait="${2:-0}" dir="/var/lib/fnos-stor/selfheal"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  command -v flock >/dev/null 2>&1 || { ACTION_LOCK_FD=""; return 0; }   # 无 flock 则不拦
+  exec 8>"$dir/ct${ctid}.lock" 2>/dev/null || return 1
+  if flock -w "$wait" 8; then ACTION_LOCK_FD=8; return 0; fi
+  exec 8>&- 2>/dev/null
+  return 1
+}
+action_lock_release() {
+  [ -n "$ACTION_LOCK_FD" ] || return 0
+  flock -u 8 2>/dev/null
+  exec 8>&- 2>/dev/null
+  ACTION_LOCK_FD=""
+}
+
 # ---------- 容器静态节点 unit（共享：stor-manage / stor-usb 链等调用） ----------
 # 背景（见 fnos/07 §13.1）：文件 bind 会被容器内 fnOS 的 umount 摘掉（写入落 stub），
 # 设备节点统一改由开机 unit 静态 mknod（Before=trim_init，fnOS 动手前节点就绪）。

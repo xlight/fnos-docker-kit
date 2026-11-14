@@ -195,6 +195,16 @@ chk_mask() { # 掩码视图：条目在、软链不悬空、组件分区在
   return $rc
 }
 
+# 组件分区 → 父盘名（fnOS 按父盘解析组件）：
+#   sdc1 → sdc（去掉尾号）｜nvme1n1p1 → nvme1n1（去掉 pN）｜zd0p1 → zd0｜本身是整盘则原样
+component_parent() { # $1=组件设备名
+  case "$1" in
+    *p[0-9]) printf '%s\n' "${1%p[0-9]*}";;
+    *[0-9])  printf '%s\n' "${1%%[0-9]*}";;
+    *)       printf '%s\n' "$1";;
+  esac
+}
+
 chk_component() { # (l) md 组件的父盘必须能被 fnOS 识别为"盘"
   # 后端存储（zvol）没有盘身份（无 ID_MODEL/ID_SERIAL）→ fnOS 的数组视图里没有组件盘
   # → 界面显示「缺失 disk 状态」（2026-11-12 实测）。
@@ -205,11 +215,7 @@ chk_component() { # (l) md 组件的父盘必须能被 fnOS 识别为"盘"
   [ -n "$mdb" ] || { bad "md 设备不存在: $md"; return 1; }
   comp="$(ls /sys/block/"$mdb"/slaves/ 2>/dev/null | head -1)"
   [ -n "$comp" ] || { bad "md $mdb 没有组件（slaves 为空）"; return 1; }
-  case "$comp" in
-    *p[0-9]) parent="${comp%p[0-9]*}";;
-    *[0-9])  parent="${comp%%[0-9]*}";;
-    *)       parent="$comp";;
-  esac
+  parent="$(component_parent "$comp")"
   if [ -e "/sys/block/$parent/device" ] \
      && { [ -s "/sys/block/$parent/device/model" ] || [ -s "/sys/block/$parent/device/serial" ]; }; then
     ok "md $mdb 组件 $comp 的父盘 $parent 有盘身份（fnOS 可识别）"
@@ -292,12 +298,15 @@ start_guard() { # 与 restart_guard 同一套防抖（冷却期 + 24h 预算）
 }
 
 fix_start() { # 拉起并记账（与重启共用预算）
+  # 与存活巡检互斥：巡检正在拉起时不要重复动作
+  action_lock_acquire "$CTID" 0 || { warn "另一破坏性动作在跑（锁占用），跳过拉起"; return 1; }
   log "修复：拉起容器（pct start $CTID）"
   local now; now="$(date +%s)"
   pct start "$CTID" >/dev/null 2>&1
   echo "$now" > "$RESTART_STATE"
   echo "$now" >> "$STATE_DIR/ct${CTID}.restarts"
   manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-start","ctid":%s,"result":"attempted"}' "$(date -Is)" "$CTID")"
+  action_lock_release
   return 0
 }
 
@@ -323,19 +332,39 @@ budget_guard() { # 只做预算判定（冷却期 + 24h 次数），不动作
 }
 
 fix_component() { # md 成员被后端存储抢走 → 停容器 → 重放 stor-manage up（重装配）→ 起容器
+  # 用**独立预算**（ct<N>.component-fixes）：本修复必须停容器，与普通重启同源但性质不同
+  # （普通重启预算被别的事务占满时，若共用预算，本项就永远修不了 → 违背"能自动修复"）。
   [ "${SELFHEAL_NO_RESTART:-0}" = "1" ] && { warn "按 SELFHEAL_NO_RESTART=1 跳过自动纠正"; return 1; }
-  budget_guard || return 1
+  # 与存活巡检互斥：修复期间不许有人把容器拉起来
+  action_lock_acquire "$CTID" 0 || { warn "另一破坏性动作在跑（锁占用），本轮跳过组件纠正"; return 1; }
+  local cf="$STATE_DIR/ct${CTID}.component-fixes" now last cnt=0 t
+  now="$(date +%s)"
+  mkdir -p "$STATE_DIR"
+  last="$(tail -1 "$cf" 2>/dev/null || echo 0)"; [ -n "$last" ] || last=0
+  if [ $((now - last)) -lt "${COMPONENT_COOLDOWN:-1800}" ]; then
+    warn "组件纠正冷却期内（${COMPONENT_COOLDOWN:-1800}s 内已纠正过），本轮跳过"
+    action_lock_release
+    return 1
+  fi
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ $((now - t)) -lt 86400 ] && cnt=$((cnt+1))
+  done < <(cat "$cf" 2>/dev/null)
+  if [ "$cnt" -ge "${COMPONENT_BUDGET:-2}" ]; then
+    warn "24h 内已纠正组件 ${cnt} 次（预算上限 ${COMPONENT_BUDGET:-2}），需人工介入"
+    action_lock_release
+    return 1
+  fi
   log "修复：纠正 md 成员（停容器 → 重放 stor-manage up 重装配 → 起容器）"
-  local now; now="$(date +%s)"
   if ct_running; then
     pct stop "$CTID" >/dev/null 2>&1
     log "已停容器（释放卷占用）"
   fi
   CTID="$CTID" bash "$SCRIPT_DIR/stor-manage.sh" up >/dev/null 2>&1
   pct start "$CTID" >/dev/null 2>&1
-  echo "$now" > "$RESTART_STATE"
-  echo "$now" >> "$STATE_DIR/ct${CTID}.restarts"
+  echo "$now" >> "$cf"
   manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"selfheal-fix-component","ctid":%s,"result":"attempted"}' "$(date -Is)" "$CTID")"
+  action_lock_release
   return 0
 }
 
@@ -359,9 +388,11 @@ restart_guard() { # 防抖：冷却期 + 24h 预算（防抖是为了不反复�
     return 1
   fi
   log "修复：重启容器让 cgroup/绑定/挂载重新生效（pct reboot $CTID）"
+  action_lock_acquire "$CTID" 0 || { warn "另一破坏性动作在跑（锁占用），跳过重启"; return 1; }
   pct reboot "$CTID"
   echo "$now" > "$RESTART_STATE"
   echo "$now" >> "$STATE_DIR/ct${CTID}.restarts"
+  action_lock_release
   return 0
 }
 
@@ -395,12 +426,43 @@ EOF
   systemctl enable "fnos-stor-selfheal-ct${CTID}.timer" >/dev/null 2>&1 && log "已启用自愈巡检 timer：$(basename "$T")"
 }
 
+# 容器刚启动时，节点/卷挂载必然查不到（还没就绪）→ **等它稳定**，
+# 否则会把"启动中"当成故障去做重启（把正在启动的容器又重启一遍 = 自愈变故障源）。
+wait_container_settle() { # 最多等 $1 秒（默认 300）
+  local max="${1:-300}" waited=0 up
+  while [ "$waited" -lt "$max" ]; do
+    ct_running || return 0
+    up="$(ct_shm "cut -d' ' -f1 /proc/uptime" 2>/dev/null | tr -d ' \r' | cut -d. -f1)"
+    [ -n "${up:-}" ] || up=999
+    # 容器已运行 ≥180s 且卷已挂载 → 认为已稳定
+    if [ "$up" -ge 180 ] && chk_mounts_quiet; then return 0; fi
+    sleep 15; waited=$((waited+15))
+  done
+  return 1
+}
+chk_mounts_quiet() { # 不记账的挂载检查（等待阶段用）
+  local QUIET_SAVE="$QUIET"; QUIET=1
+  chk_mounts >/dev/null 2>&1
+  local rc=$?
+  QUIET="$QUIET_SAVE"
+  return $rc
+}
+
 main() {
   [ "$CMD" = "check" ] || [ "$CMD" = "repair" ] || { echo "用法: $0 check|repair" >&2; exit 2; }
   need_root
   mkdir -p "$STATE_DIR"
   log "== stor-selfheal $CMD (CT$CTID) =="
   [ "$CMD" = "repair" ] && ensure_unit
+  # 容器刚启动就先等它稳定（否则会把"启动中"当成故障）
+  if [ "$CMD" = "repair" ] && ct_running; then
+    local up0
+    up0="$(ct_shm "cut -d' ' -f1 /proc/uptime" 2>/dev/null | tr -d ' \r' | cut -d. -f1)"
+    if [ -n "${up0:-}" ] && [ "$up0" -lt 180 ]; then
+      log "容器刚启动（uptime ${up0}s），等待其完成挂载…"
+      wait_container_settle 300 || warn "容器在 300s 内未稳定（继续检查）"
+    fi
+  fi
 
   local rc_ct=0 rc_mp=0 rc_stack=0 rc_conf=0 rc_mask=0 rc_nodes=0 rc_mounts=0 rc_comp=0
   CHECK_NAME=ct;         chk_ct         || rc_ct=1
@@ -431,14 +493,17 @@ main() {
   # 修复顺序：**宿主挂载点最前** → 栈 → 配置/放行 → 掩码 → 节点 →（必要时）重启容器
   # 挂载点坏着时重启容器没有意义：PVE 启动前要先激活存储，激活不了就起不来
   # （2026-11-12 事故：重启把"运行中但卷有问题"放大成"完全起不来"）。
+  # 修复顺序：**组件成员纠正 → 掩码 → 其它**
+  # 顺序有讲究：掩码会清掉"后端存储（无盘身份）"的条目，而组件纠正会把 md 成员
+  # 换到物化设备分区 —— 先清掩码再纠正成员，中间会出现"组件不可见"的 broken 态。
+  # （2026-11-12 实测踩过：掩码先重建 → /vol2 一度 arrayState=broken）
+  if [ "$rc_comp" = 1 ]; then
+    if fix_component; then COMP_FIXED=1; fi
+  fi
   [ "$rc_mp" = 1 ]     && fix_mountpoints
   [ "$rc_stack" = 1 ]  && fix_stack
   [ "$rc_conf" = 1 ]   && fix_conf
   [ "$rc_mask" = 1 ]   && fix_mask
-  # md 成员被后端存储抢走 → 停容器重装配（自身会重启容器，随后不再重复重启）
-  if [ "$rc_comp" = 1 ]; then
-    if fix_component; then COMP_FIXED=1; fi
-  fi
   [ "$rc_nodes" = 1 ]  && fix_nodes
   # 容器停机 → 拉起（不是重启）；挂载/放行/掩码问题 → 重启才生效
   if [ "$rc_ct" = 1 ]; then
@@ -472,6 +537,10 @@ main() {
     sleep 20
   fi
   log "复核："
+  # 复核前同样要等容器稳定（刚起容器时卷还没挂完 → 否则必然误报）
+  if ct_running; then
+    wait_container_settle 300 || warn "容器在 300s 内未稳定（继续复核）"
+  fi
   local again=0
   chk_ct         || again=1
   chk_mountpoints || again=1
