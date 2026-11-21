@@ -50,9 +50,12 @@ def main():
     need = {"toolchain/aobpatch.py",
             "toolchain/assets/libfnos-trashshim.so",
             "toolchain/fnos-lib-consumers",
+            "toolchain/fnos-lib-consumers-check",
             "toolchain/fnos-nginx-route.sh",
+            "toolchain/fnos-patch-repair",
             "toolchain/fnos-patch-status",
             "toolchain/fnos-patchset-fetch",
+            "toolchain/fnos-update-grub-shim",
             "scripts/stor-mount-shim.sh"}
     miss = need - set(files1)
     if miss:

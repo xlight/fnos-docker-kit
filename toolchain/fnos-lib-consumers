@@ -11,6 +11,12 @@
 # 开机重放（fnos-dirfd-shim.service，Before=trim_main）不需要本清单——此时这些
 # 服务尚未起来；live 应用（--allow-live-binary / 手工 apply --restart-consumers）
 # 才需要。
+#
+# 判定依据（2026-11-19 实测，CT201）：扫 /proc/*/maps，三个库**都要扫**
+# （libnfile.so / libnperm.so / libtrimacl.so）——少扫一个就少算消费者。
+# 当时 18 个 unit 命中，清单 12 个，差集 6 个即下方标注「补」的行。
+# trim_nginx 实测**不**链接任何被补丁库（ldd 无 libnfile/libnperm/libtrimacl），
+# 不要加进来——把 nginx 加进清单只会制造"已修好"的假象。
 trim_main.service
 dlcenter.service
 filestor_service.service
@@ -23,3 +29,12 @@ imagesrv.service
 trim_upload.service
 webdav.service
 trim_app_center.service
+# 补：以下 6 项为 2026-11-19 实测差集
+sysinfo_service.service
+trim_sharelink.service
+trim_open_gateway.service
+multiple-downloads.service
+# smbd/winbind 只链 libtrimacl.so，但该库在补丁集内（fnos-1.2.1010.json 等）；
+# 重启会带来秒级 SMB 中断 —— 有意的取舍，不重启 = 它们继续跑未打补丁的 ACL 代码。
+smbd.service
+winbind.service

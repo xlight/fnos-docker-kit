@@ -29,10 +29,12 @@ AOB_PATCHSET = "/usr/local/share/fnos-toolchain/patches/fnos-1.2.0800.json"  # �
 AOBPATCH = "/usr/local/share/fnos-toolchain/aobpatch.py"
 PATCHES_DIR = "/usr/local/share/fnos-toolchain/patches"
 VERSION_PATH = "/usr/trim/etc/version"
-# 检测层状态分类：硬失败计 issue；skipped / ready-unverified 只记 warning
-ISSUE_STATUSES = {"ready", "failed", "signature-not-found", "expect-mismatch",
-                  "unknown-file-hash", "missing-file", "verify-failed"}
-WARN_STATUSES = {"skipped", "ready-unverified"}
+# 检测层状态分类：硬失败计 issue；skipped 只记 warning。
+# ready-unverified = 模式命中、哈希未知、**未应用** → 计 issue（不是 warning）。
+# applied/already + applied_as=ready-unverified = 已应用但未验证哈希 → warning。
+ISSUE_STATUSES = {"ready", "ready-unverified", "failed", "signature-not-found",
+                  "expect-mismatch", "unknown-file-hash", "missing-file", "verify-failed"}
+WARN_STATUSES = {"skipped"}
 
 
 def _vtuple(v):
@@ -162,7 +164,11 @@ def detect_aob():
         for p in data.get("patches", []):
             pid = p.get("id", "unknown")
             status = str(p.get("status", "unknown")).split("(")[0]  # 归一化 expect-mismatch(N!=M)
-            if status in ISSUE_STATUSES:
+            applied_as = str(p.get("applied_as") or "")
+            if status in ("applied", "already") and applied_as == "ready-unverified":
+                # 已应用但哈希未验证：warning（不是 issue）
+                all_warnings.append(f"AOB:{pid}: applied-unverified")
+            elif status in ISSUE_STATUSES:
                 all_issues.append(f"AOB:{pid}: {status}")
             elif status in WARN_STATUSES:
                 all_warnings.append(f"AOB:{pid}: {status}" + (f" ({p.get('reason')})" if p.get("reason") else ""))
@@ -490,9 +496,16 @@ def notify_postgres(issues, warnings, all_healthy):
             return True  # 索引未知：保留现有通知，避免误清
 
         if not all_healthy:
+            # 未验证补丁（ready-unverified）按状态合并为一条，避免刷屏
+            unverified = [i for i in issues if ": ready-unverified" in i]
+            others = [i for i in issues if ": ready-unverified" not in i]
             body = "发现 %d 个补丁问题" % len(issues)
-            if issues:
-                body += "；" + "；".join(issues[:20])
+            if unverified:
+                body += "（其中 %d 项未验证补丁）" % len(unverified)
+            if others:
+                body += "；" + "；".join(others[:20])
+                if len(others) > 20:
+                    body += "…等 %d 项" % (len(others) - 20)
             if warnings:
                 body += "；警告：" + "；".join(warnings[:10])
             _upsert_notify(SRC_ISSUES, 1, "补丁状态", body)

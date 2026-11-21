@@ -26,6 +26,9 @@
 #   CTID              目标容器（必填，防误伤别的容器）
 #   GUARD_INTERVAL    拉起最小间隔秒（默认 300）
 #   GUARD_START_BUDGET 24h 内最大拉起次数（默认 3）
+#   GUARD_WEBUI_INTERVAL 界面重启最小间隔秒（默认 1800）
+#   GUARD_WEBUI_BUDGET  24h 内最大界面重启次数（默认 3）
+#   FNOS_WARMUP_SECONDS 界面预热窗口（默认 300，见 lib.sh）
 # ============================================================================
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,8 +46,11 @@ STATE_DIR="${GUARD_STATE_DIR:-/var/lib/fnos-stor/selfheal}"
 EXPECT_FILE="$STATE_DIR/ct${CTID}.expect"
 STATUS_FILE="$STATE_DIR/guard-ct${CTID}.json"
 START_LOG="$STATE_DIR/ct${CTID}.starts"
+WEBUI_LOG="$STATE_DIR/ct${CTID}.webui-fixes"
 INTERVAL="${GUARD_INTERVAL:-300}"
 BUDGET="${GUARD_START_BUDGET:-3}"
+WEBUI_INTERVAL="${GUARD_WEBUI_INTERVAL:-1800}"
+WEBUI_BUDGET="${GUARD_WEBUI_BUDGET:-3}"
 
 need_root
 mkdir -p "$STATE_DIR"
@@ -98,17 +104,81 @@ start_budget_ok() {
   return 0
 }
 
-emit_json() { # $1=healthy(0/1) $2=container_running(0/1) $3=mountpoints_healthy(0/1) $4=expect $5=summary
-  python3 - "$STATUS_FILE" "$1" "$2" "$3" "$4" "$5" "$CTID" <<'PY'
+# ---------- WebUI 存活（分钟级；判据实现见 lib.sh 的 webui_* 探针） ----------
+WEBUI_STATE="ok"; WEBUI_WORKERS=0; WEBUI_HTTP="000"
+webui_state() { # 依赖全局 running/expect；结果写 WEBUI_STATE
+  if [ "$expect" = "stopped" ]; then
+    WEBUI_STATE="n/a"; WEBUI_WORKERS=-1; WEBUI_HTTP="000"; return
+  fi
+  if [ "$running" != 1 ]; then
+    WEBUI_STATE="down"; WEBUI_WORKERS=-1; WEBUI_HTTP="000"; return
+  fi
+  WEBUI_WORKERS="$(webui_workers)"
+  WEBUI_HTTP="$(webui_http)"
+  local up; up="$(ct_uptime)"
+  if [ -n "$up" ] && [ "$up" -lt "$FNOS_WARMUP_SECONDS" ]; then
+    WEBUI_STATE="warming"; return
+  fi
+  if [ "$WEBUI_WORKERS" -le 0 ]; then WEBUI_STATE="bad"; return; fi
+  case "$WEBUI_HTTP" in
+    2*|3*) WEBUI_STATE="ok" ;;
+    *)     WEBUI_STATE="bad" ;;
+  esac
+}
+webui_json() { printf '{"state":"%s","workers":%s,"http":"%s"}' "$WEBUI_STATE" "$WEBUI_WORKERS" "$WEBUI_HTTP"; }
+
+webui_gate_ok() { # 双门禁：cert 文件非空 **且** nginx -t 通过
+  local cert=/usr/trim/etc/network_gateway_cert.conf
+  local nginx=/usr/trim/nginx/sbin/nginx
+  if ! timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- test -s "$cert" 2>/dev/null; then
+    log "界面恢复门禁失败：证书配置缺失或为空（$cert）"
+    return 1
+  fi
+  timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- test -x "$nginx" 2>/dev/null || nginx=nginx
+  if ! timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- "$nginx" -t >/dev/null 2>&1; then
+    log "界面恢复门禁失败：nginx -t 未通过"
+    return 1
+  fi
+  return 0
+}
+
+# 界面重启预算：24h 内最多 WEBUI_BUDGET 次，且两次之间至少 WEBUI_INTERVAL 秒
+webui_budget_ok() {
+  local now last cnt=0 t
+  now="$(date +%s)"
+  last="$(tail -1 "$WEBUI_LOG" 2>/dev/null || echo 0)"
+  [ -n "$last" ] || last=0
+  if [ $((now - last)) -lt "$WEBUI_INTERVAL" ]; then
+    log "界面重启被抑制：距上次不足 ${WEBUI_INTERVAL}s"
+    return 1
+  fi
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    [ $((now - t)) -lt 86400 ] && cnt=$((cnt+1))
+  done < <(cat "$WEBUI_LOG" 2>/dev/null)
+  if [ "$cnt" -ge "$WEBUI_BUDGET" ]; then
+    log "界面重启被抑制：24h 内已重启 ${cnt} 次（预算上限 ${WEBUI_BUDGET}），需人工介入"
+    return 1
+  fi
+  return 0
+}
+
+emit_json() { # $1=healthy(0/1) $2=container_running(0/1) $3=mountpoints_healthy(0/1) $4=expect $5=summary $6=webui(JSON)
+  python3 - "$STATUS_FILE" "$1" "$2" "$3" "$4" "$5" "$6" "$CTID" <<'PY'
 import datetime, json, os, sys
-path, healthy, running, mp_ok, expect, summary, ctid = sys.argv[1:8]
+path, healthy, running, mp_ok, expect, summary, webui_raw, ctid = sys.argv[1:9]
+try:
+    webui = json.loads(webui_raw) if webui_raw else {}
+except ValueError:
+    webui = {"state": "unknown", "raw": webui_raw}
 doc = {"ctid": int(ctid),
        "checked_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
        "healthy": healthy == "1",
        "container_running": running == "1",
        "mountpoints_healthy": mp_ok == "1",
        "expect": expect,
-       "summary": summary}
+       "summary": summary,
+       "webui": webui}
 try:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -131,6 +201,9 @@ Wants=fnos-stor-selfheal-ct${CTID}.service
 [Service]
 Type=oneshot
 Environment=CTID=${CTID}
+Environment=GUARD_WEBUI_BUDGET=${WEBUI_BUDGET}
+# 容器半死时裸 pct exec 会挂住；oneshot 默认无启动超时，这里显式限时
+TimeoutStartSec=120
 ExecStart=${SCRIPT_DIR}/stor-guard.sh repair
 EOF
   cat > "$T" <<EOF
@@ -157,9 +230,16 @@ main() {
 
   ct_running && running=1
   [ "$(mp_healthy)" = "1" ] && mp_ok=1
+  webui_state
 
   if [ "$running" = 1 ] && [ "$mp_ok" = 1 ]; then
-    healthy=1; summary="存活正常"
+    case "$WEBUI_STATE" in
+      ok)      healthy=1; summary="存活正常" ;;
+      warming) healthy=1; summary="存活正常（界面预热中 ${FNOS_WARMUP_SECONDS}s 窗口）" ;;
+      bad)     healthy=0; summary="不健康：界面不可用（worker=${WEBUI_WORKERS} http=${WEBUI_HTTP}）" ;;
+      n/a)     healthy=1; summary="存活正常" ;;
+      *)       healthy=0; summary="不健康：容器状态异常" ;;
+    esac
   elif [ "$expect" = "stopped" ]; then
     healthy=1; summary="按期望保持停机"
   else
@@ -169,21 +249,21 @@ main() {
   fi
 
   if [ "$CMD" = "status" ]; then
-    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary"
+    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" "$(webui_json)"
     [ "$healthy" = 1 ] && exit 0 || exit 1
   fi
 
   if [ "$CMD" = "check" ]; then
-    printf '  %-14s 容器运行=%s 宿主挂载点=%s 期望=%s → %s\n' "存活巡检" \
+    printf '  %-14s 容器运行=%s 宿主挂载点=%s 界面=%s 期望=%s → %s\n' "存活巡检" \
       "$([ "$running" = 1 ] && echo yes || echo no)" \
-      "$([ "$mp_ok" = 1 ] && echo ok || echo bad)" "$expect" "$summary"
-    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" >/dev/null
+      "$([ "$mp_ok" = 1 ] && echo ok || echo bad)" "$WEBUI_STATE" "$expect" "$summary"
+    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" "$(webui_json)" >/dev/null
     [ "$healthy" = 1 ] && exit 0 || exit 1
   fi
 
   # repair：健康态零动作
   if [ "$healthy" = 1 ]; then
-    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" >/dev/null
+    emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" "$(webui_json)" >/dev/null
     exit 0
   fi
 
@@ -224,10 +304,46 @@ main() {
     fi
   fi
 
-  emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" >/dev/null
-  printf '  %-14s 容器运行=%s 宿主挂载点=%s 期望=%s → %s\n' "存活巡检" \
+  # 容器刚被拉起时界面必然处于预热窗口 → 重新探测一次，避免用旧结论
+  [ "$running" = 1 ] && webui_state
+
+  # ③ 界面不可用 → 双门禁 + 重启（独立预算；与容器拉起/自愈互斥）
+  if [ "$running" = 1 ] && [ "$expect" = "running" ] && [ "$WEBUI_STATE" = "bad" ]; then
+    if ! webui_gate_ok; then
+      summary="不健康：界面不可用，且恢复门禁不通过（配置缺失/语法错误）"
+    elif ! action_lock_acquire "$CTID" 0; then
+      summary="另一破坏性动作在跑（锁占用），本轮不重启界面"
+      log "$summary"
+    elif ! webui_budget_ok; then
+      summary="界面不可用，重启被预算/冷却抑制"
+      action_lock_release
+    else
+      log "界面不可用且门禁通过 → 重启 trim_nginx"
+      if timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- systemctl restart trim_nginx.service >/dev/null 2>&1; then
+        echo "$(date +%s)" >> "$WEBUI_LOG"
+        sleep 3
+        webui_state
+        if [ "$WEBUI_STATE" = "ok" ]; then
+          healthy=1; summary="界面已恢复"
+          log "界面已恢复（worker=${WEBUI_WORKERS} http=${WEBUI_HTTP}）"
+          manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"guard-webui-restart","ctid":%s,"result":"ok","workers":%s,"http":"%s"}' "$(date -Is)" "$CTID" "$WEBUI_WORKERS" "$WEBUI_HTTP")"
+        else
+          summary="界面重启后仍未恢复（worker=${WEBUI_WORKERS} http=${WEBUI_HTTP}）"
+          log "$summary"
+          manifest_add "$(printf '{"ts":"%s","mech":"host-storage","action":"guard-webui-restart","ctid":%s,"result":"failed","workers":%s,"http":"%s"}' "$(date -Is)" "$CTID" "$WEBUI_WORKERS" "$WEBUI_HTTP")"
+        fi
+      else
+        summary="界面重启命令执行失败"
+        log "$summary"
+      fi
+      action_lock_release
+    fi
+  fi
+
+  emit_json "$healthy" "$running" "$mp_ok" "$expect" "$summary" "$(webui_json)" >/dev/null
+  printf '  %-14s 容器运行=%s 宿主挂载点=%s 界面=%s 期望=%s → %s\n' "存活巡检" \
     "$([ "$running" = 1 ] && echo yes || echo no)" \
-    "$([ "$mp_ok" = 1 ] && echo ok || echo bad)" "$expect" "$summary"
+    "$([ "$mp_ok" = 1 ] && echo ok || echo bad)" "$WEBUI_STATE" "$expect" "$summary"
   [ "$healthy" = 1 ] && exit 0 || exit 1
 }
 

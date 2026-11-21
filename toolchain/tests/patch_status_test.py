@@ -42,11 +42,18 @@ def main():
     rec = os.path.join(W, "sql.log")
     orig_run_cmd = m["run_cmd"]
 
+    state = {"patches": []}
+
     def fake_run_cmd(cmd, timeout=30):
         if cmd[:3] == ["sudo", "-u", "postgres"]:
             with open(rec, "a") as f:
                 f.write(cmd[-1] + "\n---\n")
             return 0, "", ""
+        joined = " ".join(cmd)
+        if "aobpatch.py" in joined and "check" in cmd:
+            only = cmd[cmd.index("--only") + 1] if "--only" in cmd else "all"
+            patches = state["patches"] if only == "aob" else []
+            return 0, json.dumps({"phase": "checked", "patches": patches}), ""
         return orig_run_cmd(cmd, timeout)
     m["run_cmd"] = fake_run_cmd
     open(os.path.join(W, "version"), "w").write("1.2.1010\n")
@@ -59,6 +66,7 @@ def main():
         json.dump({"fnos_version": "V" + v, "patches": [], "file_hashes": {}},
                   open(os.path.join(pdir, "fnos-%s.json" % v), "w"))
     m["PATCHES_DIR"] = pdir
+    m["AOBPATCH"] = os.path.join(TC, "aobpatch.py")
     for rv, expect in [("1.2.1010", "exact"), ("1.2.1099", "fallback"),
                        ("1.2.0700", "no-compatible"), ("1.2.1010-rc1", "no-compatible")]:
         open(os.path.join(W, "version"), "w").write(rv + "\n")
@@ -145,6 +153,43 @@ def main():
         ok("7.3 索引未知: 保留通知 + pending_target=unknown")
     else:
         no("7.3 索引未知行为不符")
+
+    # --- 2.1 ready-unverified 分类 ---
+    state["patches"] = [
+        {"id": "p1", "file": "usr/trim/lib/libnperm.so", "status": "ready-unverified"},
+        {"id": "p2", "file": "usr/trim/lib/libnperm.so", "status": "applied",
+         "applied_as": "ready-unverified"},
+        {"id": "p3", "file": "usr/trim/lib/libnperm.so", "status": "skipped",
+         "reason": "no-match"},
+    ]
+    res = m["detect_aob"]()
+    iss, warns = res["issues"], res["warnings"]
+    if "AOB:p1: ready-unverified" in iss and res["ok"] is False:
+        ok("2.1a 未应用的 ready-unverified → issue")
+    else:
+        no("2.1a ready-unverified 未计 issue: %r / ok=%r" % (iss, res["ok"]))
+    if "AOB:p2: applied-unverified" in warns and not any("p2" in i for i in iss):
+        ok("2.1b applied_as=ready-unverified → warning")
+    else:
+        no("2.1b applied-unverified 分类错: %r / %r" % (iss, warns))
+    if not any("p3" in i for i in iss):
+        ok("2.1c skipped 仍是 warning，不计 issue")
+    else:
+        no("2.1c skipped 被误判 issue")
+
+    # --- 2.2 通知分组 ---
+    open(rec, "w").write("")
+    open(m["PROXY_INDEX_PATH"], "w").write(json.dumps(
+        {"revision": 1, "versions": {}}))
+    m["notify_postgres"](
+        ["AOB:a: ready-unverified", "AOB:b: ready-unverified", "AOB:c: ready"],
+        [], False)
+    sql = open(rec).read()
+    if ("发现 3 个补丁问题（其中 2 项未验证补丁）；AOB:c: ready" in sql
+            and "AOB:a: ready-unverified" not in sql):
+        ok("2.2 未验证补丁合并为一条计数，其余逐条列")
+    else:
+        no("2.2 通知分组不符: %s" % sql[:300])
 
     print()
     print("== patch_status_test: PASS=%d FAIL=%d ==" % (PASS, FAIL))

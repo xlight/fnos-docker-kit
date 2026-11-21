@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+# ============================================================================
+# fnos-lib-consumers-check —— 消费者清单的**运行期核对**（needrestart 式）
+#
+# 一个扫描器，两个结论：
+#   ① 完整性：谁在映射被补丁的库（/proc/*/maps），用 cgroup 映射到 unit，
+#      与 lib-consumers.txt 求差集 → 非空说明清单漏了消费者；
+#   ② 生效性：maps 里的 (dev,ino) 与磁盘当前文件不一致、或路径带 ` (deleted)`
+#      → 该进程仍在使用**旧 inode**（补丁已落盘但未重启）。
+#
+# 为什么需要：补丁用 os.replace 换 inode，已运行进程仍持旧 inode；而
+# `restart_consumers()` 会吞掉单个 `systemctl restart` 的失败，所以"文件对了"
+# 不等于"进程生效"。本脚本把这件事变成可断言的结论。
+#
+# cgroup v2 格式：`0::/system.slice/<unit>`（无结尾斜杠）——必须取最后一个路径
+# 分量并只认 `.service`；按旧格式 `.../<unit>/` 写解析会一个都匹配不到。
+#
+# 用法：
+#   fnos-lib-consumers-check [--json] [--no-active]
+# 退出码：0 完整/生效/在跑；1 有缺项或未生效或未运行
+# ============================================================================
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+TOOLCHAIN_DIR = os.environ.get("FNOS_TOOLCHAIN_DIR", "/usr/local/share/fnos-toolchain")
+PATCHES_DIR = os.environ.get("FNOS_PATCHES_DIR", os.path.join(TOOLCHAIN_DIR, "patches"))
+VERSION_PATH = os.environ.get("FNOS_VERSION_PATH", "/usr/trim/etc/version")
+CONSUMERS_LIST = os.environ.get("FNOS_CONSUMERS_LIST",
+                                os.path.join(TOOLCHAIN_DIR, "lib-consumers.txt"))
+PROC_ROOT = os.environ.get("FNOS_PROC_ROOT", "/proc")  # 测试钩子
+
+# 补丁集里被替换的库（所有历史补丁集都只动这三个）
+KNOWN_LIBS = ("libnfile.so", "libnperm.so", "libtrimacl.so")
+
+
+def vtuple(v):
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(v or ""))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def running_version():
+    try:
+        with open(VERSION_PATH, encoding="utf-8") as f:
+            return f.read().strip().lstrip("Vv")
+    except OSError:
+        return ""
+
+
+def select_patchset():
+    """精确 → 最近严格更早 → None（与 fnos-patch-status 同语义）。"""
+    ver = vtuple(running_version())
+    best, best_v = None, None
+    for path in sorted(glob.glob(os.path.join(PATCHES_DIR, "fnos-*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                pv = str(json.load(f).get("fnos_version", "")).lstrip("Vv")
+        except (OSError, ValueError):
+            continue
+        pt = vtuple(pv)
+        if not pt:
+            continue
+        if ver and pt == ver:
+            return path
+        if not ver or pt < ver:
+            if best_v is None or pt > best_v:
+                best, best_v = path, pt
+    return best
+
+
+def patched_libs(patchset):
+    """补丁集实际替换的库 basename 集合。"""
+    libs = set(KNOWN_LIBS)
+    if patchset:
+        try:
+            with open(patchset, encoding="utf-8") as f:
+                data = json.load(f)
+            for p in data.get("patches", []):
+                base = os.path.basename(str(p.get("file", "")))
+                if base.endswith(".so"):
+                    libs.add(base)
+        except (OSError, ValueError):
+            pass
+    return libs
+
+
+def read_list():
+    units = []
+    try:
+        with open(CONSUMERS_LIST, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    units.append(line.split()[0])
+    except OSError:
+        return None
+    return units
+
+
+def unit_of(pid):
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "cgroup"), encoding="utf-8") as f:
+            for line in f:
+                path = line.strip().split(":")[-1]
+                for part in path.split("/"):
+                    if part.endswith(".service"):
+                        return part
+    except OSError:
+        pass
+    return None
+
+
+def scan_maps(libs):
+    """返回 {(unit, path, inode): lib}。"""
+    hits = {}
+    for entry in os.listdir(PROC_ROOT):
+        if not entry.isdigit():
+            continue
+        maps = os.path.join(PROC_ROOT, entry, "maps")
+        try:
+            with open(maps, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        unit = None
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            # maps 的 pathname 可能含空格，且被替换的文件会追加 " (deleted)"
+            path = " ".join(parts[5:])
+            base = os.path.basename(path.replace(" (deleted)", ""))
+            if base not in libs:
+                continue
+            if unit is None:
+                unit = unit_of(entry)
+            if not unit:
+                continue
+            try:
+                ino = int(parts[4])
+            except ValueError:
+                ino = 0
+            hits[(unit, path, ino)] = base
+    return hits
+
+
+def disk_inode(path):
+    clean = path.replace(" (deleted)", "")
+    try:
+        return os.stat(clean).st_ino
+    except OSError:
+        return None
+
+
+def check_active(units):
+    """只要求"应运行"的 unit 在跑：enabled 且非 static 的才算。"""
+    inactive = []
+    for u in units:
+        try:
+            en = subprocess.run(["systemctl", "is-enabled", u], capture_output=True,
+                                text=True, timeout=10).stdout.strip()
+            ac = subprocess.run(["systemctl", "is-active", u], capture_output=True,
+                                text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if en in ("enabled", "enabled-runtime") and ac != "active":
+            inactive.append({"unit": u, "enabled": en, "active": ac})
+    return inactive
+
+
+def main():
+    as_json = "--json" in sys.argv[1:]
+    check_act = "--no-active" not in sys.argv[1:]
+
+    ps = select_patchset()
+    libs = patched_libs(ps)
+    lst = read_list()
+    doc = {
+        "version": running_version(),
+        "patchset": os.path.basename(ps) if ps else None,
+        "libs": sorted(libs),
+        "list": CONSUMERS_LIST,
+        "list_missing": lst is None,
+        "missing": [],
+        "stale": [],
+        "linked": [],
+        "inactive": [],
+    }
+
+    hits = scan_maps(libs)
+    linked = sorted({u for (u, _p, _i) in hits})
+    doc["linked"] = linked
+
+    if lst is not None:
+        doc["missing"] = sorted(set(linked) - set(lst))
+
+    stale = []
+    for (unit, path, ino) in sorted(hits):
+        disk = disk_inode(path)
+        deleted = path.endswith(" (deleted)")
+        if deleted or disk is None or disk != ino:
+            stale.append({"unit": unit, "lib": os.path.basename(path.replace(" (deleted)", "")),
+                          "path": path, "mapped_inode": ino, "disk_inode": disk,
+                          "deleted": deleted})
+    doc["stale"] = stale
+
+    if lst is not None and check_act:
+        doc["inactive"] = check_active(lst)
+
+    doc["ok"] = (not doc["list_missing"]) and not doc["missing"] and not doc["stale"] and not doc["inactive"]
+
+    if as_json:
+        print(json.dumps(doc, ensure_ascii=False))
+    else:
+        print("version=%s patchset=%s libs=%s" % (doc["version"] or "-",
+                                                  doc["patchset"] or "-", ",".join(sorted(libs))))
+        print("linked=%d list=%s missing=%s stale=%d inactive=%d ok=%s"
+              % (len(linked), "missing" if doc["list_missing"] else "ok",
+                 ",".join(doc["missing"]) or "-", len(stale),
+                 len(doc["inactive"]), doc["ok"]))
+        for it in stale[:20]:
+            print("  STALE %s %s (mapped=%s disk=%s deleted=%s)"
+                  % (it["unit"], it["path"], it["mapped_inode"], it["disk_inode"], it["deleted"]))
+        for it in doc["inactive"][:20]:
+            print("  INACTIVE %s (%s / %s)" % (it["unit"], it["enabled"], it["active"]))
+    return 0 if doc["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

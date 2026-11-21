@@ -1,0 +1,86 @@
+#!/bin/sh
+# ============================================================================
+# fnos-update-grub-shim —— 容器内 `update-grub` 兼容包装
+#
+# 背景（fnos/44-ota-postupdate-failure-nginx-stopwatching.md）：
+#   fnOS 的 OTA postupdate 脚本最后一条命令是**裸** `update-grub`，脚本没有
+#   `set -e`，因此**只有这一条命令的退出码决定升级成败**。容器根是宿主上的
+#   loop 文件（/dev/loop0），容器内没有 loop 设备节点与 sysfs backing，
+#   grub-probe 必然失败：
+#       grub-probe: error: failed to get canonical path of `/dev/loop0'.
+#   容器本就不靠自己的 grub 引导（引导由宿主负责），所以这里把"根设备无法解析"
+#   降级为跳过；其它失败一律透传，避免掩盖真实故障。
+#
+# 分支：
+#   1) grub-probe 失败（rc≠0 且 ≠127）→ 记原因、exit 0（不写 grub.cfg）
+#   2) 探测通过但真身缺失            → 记原因、exit 0（没有 grub 要更新，不是失败）
+#   3) 探测通过且真身存在            → 绝对路径调真身并透传退出码
+#   4) grub-probe 本身不存在（127）   → 无法判断，透传真身（如实报错）
+#
+# 每次调用都写 marker（默认 /run/fnos-update-grub-shim.last），供安装器/巡检
+# 核对"shim 是否被绕过"：postupdate 在 update-grub 前一行 `touch /boot/need-depmod`，
+# 若该文件比 marker 新，说明收尾走到了 grub 步骤却没经过本 shim。
+#
+# 自检：`command -v update-grub` 应指向 /usr/local/sbin/update-grub
+# 安装：`sudo env CTID=201 bash scripts/fnos-ota-resilience.sh apply`
+#
+# 测试钩子（仅自测用，生产走默认值）：
+#   FNOS_UPDATE_GRUB_MARKER / FNOS_UPDATE_GRUB_REAL / FNOS_UPDATE_GRUB_PROBE
+# ============================================================================
+set -u
+
+MARKER="${FNOS_UPDATE_GRUB_MARKER:-/run/fnos-update-grub-shim.last}"
+REAL="${FNOS_UPDATE_GRUB_REAL:-/usr/sbin/update-grub}"
+PROBE="${FNOS_UPDATE_GRUB_PROBE:-grub-probe}"
+TAG=fnos-update-grub-shim
+
+log() { logger -t "$TAG" -- "$*" 2>/dev/null || true; }
+
+write_marker() { # $1=branch $2=reason $3=real_rc
+    {
+        printf 'ts=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf 'branch=%s\n' "$1"
+        printf 'reason=%s\n' "$2"
+        printf 'real_rc=%s\n' "$3"
+    } >"$MARKER" 2>/dev/null || true
+}
+
+# ---- 探测根设备（stderr 进变量，stdout 丢弃）----
+probe_err="$("$PROBE" --target=device / 2>&1 >/dev/null)"
+probe_rc=$?
+
+# ---- 分支 4：没有 grub-probe，无法判断 → 透传 ----
+if [ "$probe_rc" -eq 127 ]; then
+    log "grub-probe 不可用，无法判断是否适用；透传真身"
+    if [ ! -x "$REAL" ]; then
+        log "真身缺失且无法探测：$REAL —— 无事可做"
+        write_marker "skip-no-real" "real missing; grub-probe not found" "0"
+        exit 0
+    fi
+    "$REAL" "$@"
+    rc=$?
+    write_marker "passthrough-no-probe" "grub-probe not found" "$rc"
+    exit "$rc"
+fi
+
+# ---- 分支 1：根设备无法解析 → 跳过 ----
+if [ "$probe_rc" -ne 0 ]; then
+    reason="$(printf '%s' "$probe_err" | head -1)"
+    [ -n "$reason" ] || reason="grub-probe rc=$probe_rc"
+    log "grub-probe 无法解析根设备（容器根是 loop 文件），跳过 grub 更新：$reason"
+    write_marker "skip-probe" "$reason" "0"
+    exit 0
+fi
+
+# ---- 分支 2：真身缺失 → 跳过 ----
+if [ ! -x "$REAL" ]; then
+    log "根设备可解析，但真身缺失（$REAL）——无事可做"
+    write_marker "skip-no-real" "real missing" "0"
+    exit 0
+fi
+
+# ---- 分支 3：调真身并透传退出码 ----
+"$REAL" "$@"
+rc=$?
+write_marker "real" "called $REAL" "$rc"
+exit "$rc"

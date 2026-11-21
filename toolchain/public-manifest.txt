@@ -14,6 +14,9 @@ toolchain/fnos_deploy.sh
 toolchain/aobpatch.py
 toolchain/fnos-patch-status
 toolchain/fnos-patchset-fetch
+toolchain/fnos-patch-repair
+toolchain/fnos-update-grub-shim
+toolchain/fnos-lib-consumers-check
 toolchain/fnos-nginx-route.sh
 toolchain/fnos-lib-consumers
 toolchain/check-iso-update.py
@@ -48,6 +51,10 @@ toolchain/tests/publish-test.sh
 toolchain/tests/fingerprints-test.py
 toolchain/tests/patchset-fetch-test.py
 toolchain/tests/index-matrix-test.py
+toolchain/tests/update-grub-shim-test.sh
+toolchain/tests/patch-repair-test.sh
+toolchain/tests/lib-consumers-check-test.py
+toolchain/tests/consumer-list-test.py
 toolchain/tests/selfheal-test.sh
 toolchain/index_builder.py
 toolchain/fnos_rootfs.py
@@ -70,6 +77,8 @@ scripts/stor-mountpoint-test.sh
 scripts/stor-guard-test.sh
 scripts/stor-manage-docker.sh
 scripts/stor-mask-docker.sh
+scripts/fnos-ota-resilience.sh
+scripts/stor-webui-test.sh
 scripts/fnos_deploy_docker.sh
 scripts/fnos-updatemgr-proxy.py
 scripts/rollback.sh

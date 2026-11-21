@@ -448,6 +448,25 @@ chk_mounts_quiet() { # 不记账的挂载检查（等待阶段用）
   return $rc
 }
 
+chk_webui_warn() { # 界面可用性只做**呈现**（warn）：判定与恢复归分钟级 stor-guard
+  local up w h
+  ct_running || { warn "界面：容器未运行，跳过（由 ct 项报告）"; return 0; }
+  up="$(ct_shm "cut -d' ' -f1 /proc/uptime" 2>/dev/null | tr -d ' \r' | cut -d. -f1)"
+  if [ -n "${up:-}" ] && [ "$up" -lt "$FNOS_WARMUP_SECONDS" ]; then
+    warn "界面：启动预热中（uptime ${up}s < ${FNOS_WARMUP_SECONDS}s）"
+    return 0
+  fi
+  w="$(webui_workers)"; h="$(webui_http)"
+  if [ "$w" -le 0 ]; then
+    warn "界面：无 worker（worker=${w} http=${h}）——由分钟级存活巡检判定与恢复"
+  elif [ "${h#2}" = "$h" ] && [ "${h#3}" = "$h" ]; then
+    warn "界面：HTTP 异常（worker=${w} http=${h}）——由分钟级存活巡检判定与恢复"
+  else
+    ok "界面：可用（worker=${w} http=${h}）"
+  fi
+  return 0
+}
+
 main() {
   [ "$CMD" = "check" ] || [ "$CMD" = "repair" ] || { echo "用法: $0 check|repair" >&2; exit 2; }
   need_root
@@ -458,7 +477,7 @@ main() {
   if [ "$CMD" = "repair" ] && ct_running; then
     local up0
     up0="$(ct_shm "cut -d' ' -f1 /proc/uptime" 2>/dev/null | tr -d ' \r' | cut -d. -f1)"
-    if [ -n "${up0:-}" ] && [ "$up0" -lt 180 ]; then
+    if [ -n "${up0:-}" ] && [ "$up0" -lt "$FNOS_WARMUP_SECONDS" ]; then
       log "容器刚启动（uptime ${up0}s），等待其完成挂载…"
       wait_container_settle 300 || warn "容器在 300s 内未稳定（继续检查）"
     fi
@@ -473,6 +492,7 @@ main() {
   CHECK_NAME=component;  chk_component  || rc_comp=1
   CHECK_NAME=nodes;      chk_nodes      || rc_nodes=1
   CHECK_NAME=mounts;     chk_mounts     || rc_mounts=1
+  CHECK_NAME=webui;      chk_webui_warn || true
 
   local bad_count=$((rc_ct+rc_mp+rc_stack+rc_conf+rc_mask+rc_nodes+rc_mounts+rc_comp))
   if [ "$bad_count" = 0 ]; then

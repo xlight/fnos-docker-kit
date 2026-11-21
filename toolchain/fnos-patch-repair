@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+# ============================================================================
+# fnos-patch-repair —— 补丁重放修复轮（锁 / 活动闸门 / 三态 / 预算 / 按需取补丁集）
+#
+# 为什么需要它（fnos/44 号文）：
+#   `fnos-patch-status` 只做检测（开机 + 6h 通知），`--auto-fix` 虽幂等但**无锁、
+#   无预算、无"不可动作"分类**；OTA 收尾失败时补丁层会一直坏着（44 号文 40 项失效）。
+#   本脚本把"检测 → 修复 → 复核"编排成一个短周期、可回撤、可审计的单元。
+#
+# 纪律：
+#   · 并发锁：flock 不可用 → waiting（fail-closed，不沿用 lib.sh 的 fail-open）；
+#   · 活动闸门：升级/包管理进行中一律不动作（15min 周期会撞上 OTA 窗口）；
+#   · 三态与退出码：healthy=0 / waiting=1 / failed=2（unit SuccessExitStatus=0 1 2）；
+#   · 预算：二进制 live 应用冷却 30min、24h ≤ 4 次；版本变化即重置（含冷却）；
+#   · 判据只信 `healthy` + `issues` + stale 核对，**不看** auto_fix 的 fixed/failed 计数
+#     （restart_consumers 会吞掉单个 systemctl restart 的失败，计数会假绿）；
+#   · 运行时长上界：内部 signal.alarm(3300)，超时判 failed 并写原因（unit 另有 3600s 硬顶）。
+#
+# 用法（容器内）：
+#   fnos-patch-repair [--json] [--max-seconds N] [--no-fetch] [--force]
+# 退出码：0 healthy / 1 waiting / 2 failed
+# ============================================================================
+import fcntl
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+PATCH_STATUS = os.environ.get("FNOS_PATCH_STATUS", "/usr/local/sbin/fnos-patch-status")
+CONSUMERS_CHECK = os.environ.get("FNOS_CONSUMERS_CHECK", "/usr/local/sbin/fnos-lib-consumers-check")
+PATCHSET_FETCH = os.environ.get("FNOS_PATCHSET_FETCH", "/usr/local/sbin/fnos-patchset-fetch")
+DIRFD_SHIM = os.environ.get("FNOS_DIRFD_SHIM", "/usr/local/sbin/fnos-dirfd-shim.py")
+LOCK_PATH = os.environ.get("FNOS_PATCH_REPAIR_LOCK", "/run/fnos-patch-repair.lock")
+STATE_DIR = os.environ.get("FNOS_PATCH_REPAIR_STATE", "/var/lib/fnos-patch-repair")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+VERSION_PATH = os.environ.get("FNOS_VERSION_PATH", "/usr/trim/etc/version")
+
+COOLDOWN = int(os.environ.get("FNOS_PATCH_REPAIR_COOLDOWN", "1800"))       # 30min
+MAX_24H = int(os.environ.get("FNOS_PATCH_REPAIR_MAX_24H", "4"))
+DEFAULT_MAX_SECONDS = int(os.environ.get("FNOS_PATCH_REPAIR_MAX_SECONDS", "3300"))
+ACTIVITY_TIMEOUT = 5
+
+# 补丁级"不可自动动作"状态（auto_fix 不会碰它们，重检也不会变）
+# 可强制应用的补丁状态：模式命中、哈希未知、未应用（aobpatch 保证 n == expect）
+FORCEABLE_PATCH_STATUS = {"ready-unverified"}
+NON_ACTIONABLE_PATCH_STATUS = {
+    "missing-file", "unknown-file-hash", "signature-not-found", "expect-mismatch",
+    "skipped", "ambiguous",
+}
+# 层级前缀：IMAGE:* 一律不可自动动作；MECH:* 里 auto_fix 能修的少数项在修完后
+# 若仍存在，也归 waiting（见 classify）。
+NON_ACTIONABLE_PREFIXES = ("IMAGE:",)
+
+
+def log(msg):
+    print("[patch-repair] %s" % msg, file=sys.stderr)
+
+
+def emit(state, reason, rc, **extra):
+    doc = {"state": state, "reason": reason, "rc": rc}
+    doc.update(extra)
+    print(json.dumps(doc, ensure_ascii=False))
+    return rc
+
+
+def run_cmd(cmd, timeout=900):
+    """跑外部命令，返回 (rc, stdout, stderr)；超时/不存在 → rc=-1。"""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except OSError as e:
+        return -1, "", str(e)
+
+
+# ---------------------------------------------------------------------------
+# 运行时长上界
+# ---------------------------------------------------------------------------
+class Timeout(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise Timeout("内部超时")
+
+
+# ---------------------------------------------------------------------------
+# 状态文件（原子写）
+# ---------------------------------------------------------------------------
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("version", "")
+            d.setdefault("last_repair_at", 0)
+            d.setdefault("repairs_24h", [])
+            return d
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        log("状态文件不可解析，按空状态处理：%s" % e)
+    return {"version": "", "last_repair_at": 0, "repairs_24h": []}
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_PATH + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_PATH)
+
+
+# ---------------------------------------------------------------------------
+# 活动闸门（升级 / 包管理进行中不动作）
+# ---------------------------------------------------------------------------
+def _pgrep_comm(pattern):
+    """按 comm 精确匹配（不用 -f，避免脚本自身命令行自匹配）。"""
+    try:
+        r = subprocess.run(["pgrep", "-x", pattern], capture_output=True, text=True,
+                           timeout=ACTIVITY_TIMEOUT)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _dpkg_lock_held():
+    lock = "/var/lib/dpkg/lock-frontend"
+    try:
+        r = subprocess.run(["fuser", "-s", lock], capture_output=True, text=True,
+                           timeout=ACTIVITY_TIMEOUT)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def activity_reason():
+    for pat in ("trim-update|liveupdate", "dpkg|apt|apt-get|dpkg-deb"):
+        if _pgrep_comm(pat):
+            return "升级/包管理进程在运行: %s" % pat
+    if _dpkg_lock_held():
+        return "dpkg 前端锁被持有"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 调用 fnos-patch-status
+# ---------------------------------------------------------------------------
+def patch_status(auto_fix=False, timeout=1800):
+    """返回 (doc, rc, err)。doc 为 None 表示输出不可解析（工具失败）。"""
+    cmd = [PATCH_STATUS, "--json"]
+    if auto_fix:
+        cmd += ["--auto-fix", "--allow-live-binary"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, -1, "fnos-patch-status 超时（%ss）" % timeout
+    except OSError as e:
+        return None, -1, "fnos-patch-status 无法执行: %s" % e
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        return None, r.returncode, "fnos-patch-status 输出非 JSON (rc=%s): %s" % (
+            r.returncode, (r.stderr or r.stdout)[:200])
+    if not isinstance(doc, dict):
+        return None, r.returncode, "fnos-patch-status 输出不是 JSON 对象"
+    return doc, r.returncode, None
+
+
+def fetch_patchset(timeout=180):
+    if not os.path.exists(PATCHSET_FETCH):
+        return False, "fnos-patchset-fetch 不存在"
+    try:
+        r = subprocess.run([PATCHSET_FETCH], capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, "rc=%d" % r.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------------------
+# 消费者生效核对
+# ---------------------------------------------------------------------------
+def consumers_check(timeout=120):
+    """返回 (doc, err)。doc=None 表示核对不可用（fail-closed）。"""
+    if not os.path.exists(CONSUMERS_CHECK):
+        return None, "fnos-lib-consumers-check 不存在（机制不完整）"
+    try:
+        r = subprocess.run([CONSUMERS_CHECK, "--json"], capture_output=True, text=True,
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        return None, "消费者核对输出非 JSON: %s" % (r.stderr or r.stdout)[:200]
+    if not isinstance(doc, dict):
+        return None, "消费者核对输出不是 JSON 对象"
+    return doc, None
+
+
+# ---------------------------------------------------------------------------
+# 分类
+# ---------------------------------------------------------------------------
+def _issue_kind(issue):
+    """把 issue 归一化成 (kind, detail)。kind ∈ ok|waiting|failed|unknown"""
+    if issue == "no-compatible-patchset":
+        return "waiting", issue
+    if issue.startswith(NON_ACTIONABLE_PREFIXES):
+        return "waiting", issue
+    if issue.startswith("MECH:"):
+        return "waiting", issue          # 修复后仍存在的机制项 = 需宿主侧脚本
+    if issue.startswith("AOB:"):
+        rest = issue.split(":", 2)
+        status = rest[2].split(" ", 1)[0] if len(rest) > 2 else ""
+        if status in FORCEABLE_PATCH_STATUS:
+            return "force", issue
+        if status in NON_ACTIONABLE_PATCH_STATUS:
+            return "waiting", issue
+        if status in ("failed", "verify-failed"):
+            return "failed", issue
+        return "failed", issue           # 其它补丁级异常按失败处理（保守）
+    return "unknown", issue
+
+
+def classify(doc):
+    """返回 (state, waiting_list, failed_list, unknown_list)。"""
+    issues = doc.get("issues") or []
+    waiting, failed, unknown = [], [], []
+    for it in issues:
+        kind, detail = _issue_kind(str(it))
+        if kind == "force":
+            continue          # 由修复轮的 force 分支处理，不计入 waiting/failed
+        (waiting if kind == "waiting" else failed if kind == "failed" else unknown).append(detail)
+    # 未知形态保守归 failed（fail-closed），但记录原样
+    failed.extend(unknown)
+    if not issues:
+        return "healthy", [], [], []
+    if failed:
+        return "failed", waiting, failed, unknown
+    return "waiting", waiting, failed, unknown
+
+
+# ---------------------------------------------------------------------------
+# 预算
+# ---------------------------------------------------------------------------
+def budget_ok(state, now):
+    last = state.get("last_repair_at") or 0
+    if now - last < COOLDOWN:
+        return False, "冷却中（距上次 %ds < %ds）" % (now - last, COOLDOWN)
+    recent = [t for t in (state.get("repairs_24h") or []) if now - t < 86400]
+    state["repairs_24h"] = recent
+    if len(recent) >= MAX_24H:
+        return False, "24h 内已修复 %d 次（上限 %d）" % (len(recent), MAX_24H)
+    return True, ""
+
+
+def budget_consume(state, now):
+    state.setdefault("repairs_24h", []).append(now)
+    state["repairs_24h"] = [t for t in state["repairs_24h"] if now - t < 86400]
+    state["last_repair_at"] = now
+
+
+def current_version():
+    try:
+        with open(VERSION_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+def acquire_lock():
+    """返回 (fd, err)。flock 二进制缺失 → fail-closed。"""
+    if shutil.which("flock") is None:
+        return None, "flock 不可用（fail-closed，不无锁执行）"
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        return None, "无法打开锁文件: %s" % e
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None, "另一轮修复正在运行"
+    return fd, None
+
+
+def read_consumers():
+    path = os.environ.get("FNOS_CONSUMERS_LIST",
+                          "/usr/local/share/fnos-toolchain/lib-consumers.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [ln.strip().split()[0] for ln in f
+                    if ln.strip() and not ln.strip().startswith("#")]
+    except OSError:
+        return None
+
+
+def restart_units(units, timeout=90):
+    """重启消费者（顺序、单个 90s 上限）。返回失败列表。"""
+    failed = []
+    for u in units:
+        try:
+            r = subprocess.run(["systemctl", "restart", u], capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode != 0:
+                failed.append({"unit": u, "rc": r.returncode, "err": (r.stderr or "")[:120]})
+                log("restart %s 失败 rc=%d" % (u, r.returncode))
+        except (OSError, subprocess.TimeoutExpired) as e:
+            failed.append({"unit": u, "rc": -1, "err": str(e)[:120]})
+            log("restart %s 异常: %s" % (u, e))
+    return failed
+
+
+def force_restart_units(units, term_wait=2, timeout=90):
+    """先 `systemctl kill -s TERM <unit>` 再 restart。
+
+    为什么需要：`trim_app_center.service` 是 `KillMode=process`——`systemctl restart`
+    只杀主进程，子进程（如 trim-photos）会继续持有旧 inode，单靠 restart 永远清不掉。
+    这里只作用于**清单内**的 unit，且发生在普通 restart 之后、仍 stale 时。
+    """
+    out = []
+    for u in units:
+        try:
+            subprocess.run(["systemctl", "kill", "-s", "TERM", u], capture_output=True,
+                           text=True, timeout=30)
+            time.sleep(term_wait)
+            subprocess.run(["systemctl", "restart", u], capture_output=True, text=True,
+                           timeout=timeout)
+            out.append(u)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log("force restart %s 异常: %s" % (u, e))
+    time.sleep(term_wait)
+    return out
+
+
+def _stale_units(chk):
+    """去重（同一 unit 的多个 pid 会重复出现）。"""
+    seen, out = set(), []
+    for x in chk.get("stale") or []:
+        u = x.get("unit")
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def run(args):
+    max_seconds = DEFAULT_MAX_SECONDS
+    do_fetch = True
+    force = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--max-seconds" and i + 1 < len(args):
+            max_seconds = int(args[i + 1]); i += 2; continue
+        if a == "--no-fetch":
+            do_fetch = False
+        elif a == "--force":
+            force = True
+        elif a in ("--json",):
+            pass
+        else:
+            log("忽略未知参数: %s" % a)
+        i += 1
+
+    signal.signal(signal.SIGALRM, _alarm)
+    signal.alarm(max_seconds)
+
+    now = int(time.time())
+    state = load_state()
+
+    # 版本变化 → 重置预算与冷却
+    version = current_version()
+    if state.get("version") != version:
+        if state.get("version"):
+            log("版本变化 %s → %s，重置预算与冷却" % (state.get("version") or "-", version or "-"))
+        state["version"] = version
+        state["repairs_24h"] = []
+        state["last_repair_at"] = 0
+
+    # 1) 并发锁
+    fd, err = acquire_lock()
+    if err:
+        return emit("waiting", err, 1, lock=LOCK_PATH)
+
+    try:
+        # 2) 活动闸门
+        act = activity_reason()
+        if act:
+            return emit("waiting", act, 1, lock=LOCK_PATH)
+
+        # 3) 预检（不动作）
+        doc, rc, err = patch_status(auto_fix=False, timeout=300)
+        if doc is None:
+            return emit("failed", err or "预检失败", 2, lock=LOCK_PATH)
+        log("预检 rc=%s healthy=%s issues=%s" % (rc, doc.get("healthy"), doc.get("issues")))
+
+        # 4) 补丁集缺失 → 先按需取一次
+        issues = [str(x) for x in (doc.get("issues") or [])]
+        fetched = False
+        if do_fetch and "no-compatible-patchset" in issues:
+            log("补丁集缺失，尝试 fnos-patchset-fetch")
+            ok, msg = fetch_patchset()
+            fetched = True
+            log("fnos-patchset-fetch: ok=%s %s" % (ok, msg))
+            doc, rc, err = patch_status(auto_fix=False, timeout=300)
+            if doc is None:
+                return emit("failed", err or "取补丁集后预检失败", 2, lock=LOCK_PATH,
+                            fetched=fetched)
+            issues = [str(x) for x in (doc.get("issues") or [])]
+
+        # 5) 消费者核对（每轮无条件；文件健康 ≠ 进程生效）
+        chk, cerr = consumers_check()
+        if chk is None:
+            return emit("failed", cerr or "消费者核对不可用（机制不完整）", 2, lock=LOCK_PATH,
+                        fetched=fetched)
+        stale_units = _stale_units(chk)
+        consumers = read_consumers()
+        if chk.get("list_missing"):
+            return emit("failed", "消费者清单缺失/不可读", 2, lock=LOCK_PATH,
+                        fetched=fetched)
+        # 只有清单内的消费者允许自动重启（未知服务只报，不自动动）
+        stale_in_list = [u for u in stale_units if consumers and u in consumers]
+
+        # 6) 判断是否有可动作项
+        #    「确定不可修」= no-compatible-patchset / IMAGE:* / 补丁级不可修状态。
+        #    MECH:* 不算：auto_fix 能修其中少数几项（zpool/pg），修完仍存在的才归 waiting。
+        hard = [i for i in issues
+                if _issue_kind(i)[0] == "waiting" and not i.startswith("MECH:")]
+        waiting_only = bool(issues) and len(hard) == len(issues)
+        if waiting_only and not stale_in_list:
+            return emit("waiting", "不可自动动作: %s" % ", ".join(issues[:5]), 1,
+                        lock=LOCK_PATH, fetched=fetched, stale=chk.get("stale") or [])
+
+        # 7) 预算
+        ok, why = budget_ok(state, now)
+        if not ok and not force:
+            return emit("waiting", "修复被预算抑制：%s" % why, 1, lock=LOCK_PATH,
+                        fetched=fetched, budget={"allowed": False, "reason": why},
+                        stale=chk.get("stale") or [])
+
+        # 8) 自动修复（非 force 项）+ 强制应用（ready-unverified）
+        af = {}
+        doc2 = doc
+        force_ids = [i.split(":", 2)[1] for i in issues
+                     if i.startswith("AOB:") and i.endswith(": ready-unverified")]
+        non_force = [i for i in issues
+                     if not (i.startswith("AOB:") and i.endswith(": ready-unverified"))]
+        if non_force:
+            log("执行 --auto-fix --allow-live-binary")
+            doc2, rc2, err2 = patch_status(auto_fix=True, timeout=1800)
+            if doc2 is None:
+                return emit("failed", err2 or "自动修复失败", 2, lock=LOCK_PATH, fetched=fetched)
+            af = doc2.get("auto_fix") or {}
+            issues2 = [str(x) for x in (doc2.get("issues") or [])]
+            log("修复后 healthy=%s fixed=%s failed=%s issues=%s"
+                % (doc2.get("healthy"), af.get("fixed"), af.get("failed"), issues2))
+
+        force_applied = []
+        if force_ids:
+            log("强制应用未验证补丁（%d 项）: %s" % (len(force_ids), ", ".join(force_ids[:8])))
+            cmd = [DIRFD_SHIM, "apply", "--only", "aob",
+                   "--restart-consumers", "--best-effort", "--force-unverified"]
+            for pid in force_ids:
+                cmd += ["--patch-id", pid]
+            rc3, out3, err3 = run_cmd(cmd, timeout=1200)
+            af = dict(af)
+            if rc3 == 0:
+                force_applied = force_ids
+                af["forced"] = force_ids
+                log("强制应用成功：%d 项" % len(force_ids))
+            else:
+                af["force_failed"] = force_ids
+                af["force_rc"] = rc3
+                af["force_err"] = (err3 or out3 or "")[:200]
+                log("强制应用失败 rc=%s: %s" % (rc3, (err3 or out3 or "")[:200]))
+
+        # 9) 文件层健康但进程未生效（典型：OTA 后旧进程仍映射旧 inode）→ 重启消费者
+        #    auto_fix 已重启过（fixed>0）或 force 包装器已重启时不重复重启
+        restarted = []
+        force_restarted = []
+        if stale_in_list and not af.get("fixed") and not force_applied:
+            log("文件层健康但存在 stale 映射，重启消费者：%s" % ", ".join(stale_in_list))
+            failed_restarts = restart_units(stale_in_list)
+            restarted = stale_in_list
+            if failed_restarts:
+                af = dict(af)
+                af["restart_failed"] = failed_restarts
+            # 复核一次：KillMode=process 的 unit 重启后子进程仍可能持旧 inode
+            chk_mid, _ = consumers_check()
+            still = [u for u in _stale_units(chk_mid or {}) if u in stale_in_list]
+            if still:
+                log("普通重启后仍有 stale（KillMode=process 遗留子进程），强制终止并重启：%s"
+                    % ", ".join(still))
+                force_restarted = force_restart_units(still)
+
+        # 10) 预算只在"真的动过手"时记账（waiting 不消耗预算）
+        acted = (bool(af.get("fixed")) or bool(af.get("failed")) or bool(restarted)
+                 or bool(force_applied))
+        if acted:
+            budget_consume(state, now)
+            save_state(state)
+
+        # 11) 复核（含 stale；force / auto-fix 后重新跑一次 patch-status）
+        if force_ids or non_force:
+            doc3, rc4, err4 = patch_status(auto_fix=False, timeout=300)
+            log("复核 patch-status: %s" % (
+                ("healthy=%s issues=%s" % (doc3.get("healthy"), doc3.get("issues")))
+                if doc3 is not None else (err4 or "failed")))
+            if doc3 is not None:
+                doc2 = doc3
+        chk2, cerr2 = consumers_check()
+        if chk2 is None:
+            state["last_state"] = "failed"; save_state(state)
+            return emit("failed", cerr2 or "消费者核对不可用", 2, lock=LOCK_PATH,
+                        fetched=fetched, auto_fix=af)
+        if chk2.get("list_missing"):
+            state["last_state"] = "failed"; save_state(state)
+            return emit("failed", "消费者清单缺失/不可读", 2, lock=LOCK_PATH,
+                        fetched=fetched, auto_fix=af)
+        if chk2.get("stale"):
+            state["last_state"] = "failed"; save_state(state)
+            return emit("failed", "修复后仍有未生效的消费者: %s" % _names(chk2["stale"]), 2,
+                        lock=LOCK_PATH, fetched=fetched, auto_fix=af, stale=chk2["stale"],
+                        restarted=restarted, forced=force_applied,
+                        force_restarted=force_restarted)
+        still_unverified = [i for i in (doc2.get("issues") or [])
+                            if i.endswith(": ready-unverified")]
+        if force_ids and still_unverified:
+            state["last_state"] = "failed"; save_state(state)
+            return emit("failed", "强制应用后仍有未验证补丁: %s" % ", ".join(still_unverified[:5]), 2,
+                        lock=LOCK_PATH, fetched=fetched, auto_fix=af,
+                        forced=force_applied)
+
+        st = classify(doc2)[0]
+        state["last_state"] = st
+        save_state(state)
+        if st == "healthy":
+            return emit("healthy", "无 issue 且无 stale", 0, lock=LOCK_PATH, fetched=fetched,
+                        auto_fix=af, restarted=restarted, forced=force_applied,
+                        force_restarted=force_restarted)
+        if st == "failed":
+            return emit("failed", "修复后仍不健康: %s" % ", ".join(classify(doc2)[2][:5]), 2,
+                        lock=LOCK_PATH, fetched=fetched, auto_fix=af, restarted=restarted,
+                        forced=force_applied, force_restarted=force_restarted)
+        return emit("waiting", "不可自动动作: %s" % ", ".join(classify(doc2)[1][:5]), 1,
+                    lock=LOCK_PATH, fetched=fetched, auto_fix=af, restarted=restarted,
+                    forced=force_applied, force_restarted=force_restarted)
+    except Timeout as e:
+        log("超时：%s" % e)
+        try:
+            st = load_state(); st["last_state"] = "failed"; save_state(st)
+        except Exception:
+            pass
+        return emit("failed", "内部超时（%ss）" % max_seconds, 2)
+    finally:
+        signal.alarm(0)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _names(items):
+    out = []
+    for it in items[:8]:
+        if isinstance(it, dict):
+            out.append(it.get("unit") or it.get("lib") or json.dumps(it, ensure_ascii=False))
+        else:
+            out.append(str(it))
+    return ", ".join(out)
+
+
+def main():
+    rc = run(sys.argv[1:])
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

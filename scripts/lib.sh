@@ -19,6 +19,11 @@ VMID_CONTROL="${VMID_CONTROL:-104}"
 VMID_OTHER="${VMID_OTHER:-101}"
 FNOS_USER="${FNOS_USER:-}"
 FNOS_PORT="${FNOS_PORT:-5666}"
+# 界面启动预热窗口（秒）：容器刚起来时 fnOS 内部 nginx 往往还没就绪，
+# 此窗口内不判红、不动作（与 stor-selfheal 的 wait_container_settle 对齐）。
+FNOS_WARMUP_SECONDS="${FNOS_WARMUP_SECONDS:-300}"
+# WebUI 探针超时（秒）：Type=oneshot 默认无启动超时，容器半死时裸 pct exec 会挂住巡检。
+FNOS_PROBE_TIMEOUT="${FNOS_PROBE_TIMEOUT:-15}"
 # 凭据只从环境变量读取（公开仓脱敏：无默认账号/口令）。
 # 本地使用前先 export 相应变量，缺失时 need_creds 会显式报错。
 # 固定"登录设备号"：每次探测都用随机 did 会在 longtoken 表里不断累积设备会话
@@ -63,6 +68,30 @@ need_ct() {
     || die "CT $CTID 未运行（pct status $CTID）"
 }
 ct()  { pct exec "$CTID" -- "$@"; }
+
+# ---------- WebUI 存活探针（分钟级；stor-guard 与 stor-selfheal 共用） ----------
+# 判据（44 号文）：worker 数为 0 **或** HTTP 非 2xx/3xx → 界面不可用。
+# 只看端口会漏（事故里端口一直 LISTEN）；只看 worker 会漏"有 worker 但不响应"。
+# 所有容器内调用都带 timeout，避免容器半死时把巡检永久挂住。
+ct_uptime() { # 容器 uptime（整秒）；失败输出空
+  timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- sh -c "cut -d' ' -f1 /proc/uptime" 2>/dev/null \
+    | tr -d ' \r' | cut -d. -f1
+}
+webui_workers() { # nginx worker 计数；探针失败输出 -1
+  local n
+  # pgrep -c：无匹配也打印 0（退出码 1）；探针本身失败（容器不可达）则无输出 → -1
+  n="$(timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- pgrep -c -f "nginx: worker process" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) echo -1;; *) echo "$n";; esac
+}
+webui_http() { # 容器内 HTTP 状态码；失败输出 000
+  local c
+  c="$(timeout "$FNOS_PROBE_TIMEOUT" pct exec "$CTID" -- curl -s -m 5 -o /dev/null \
+        -w '%{http_code}' "http://127.0.0.1:${FNOS_PORT}/" 2>/dev/null)"
+  case "$c" in ''|*[!0-9]*) echo 000;; *) echo "$c";; esac
+}
+webui_probe() { # 输出 "workers=<n> http=<code>"（调用方据此判定，不在这里下结论）
+  printf 'workers=%s http=%s\n' "$(webui_workers)" "$(webui_http)"
+}
 
 # ---------- 退出码家规（fnos-ops-tui D2：0 成功 / 1 通用失败 / 2 用法错误或前置缺失；
 # 130 按惯例保留给 Ctrl-C 中断。调用者据此区分"展示用法"与"展示错误"，绝不把 2 当失败重试） ----------
@@ -366,8 +395,12 @@ lib.sh —— 供机制脚本 source 的公共库（不直接执行）：
   netlist_probe <host> [port]        打印 RESULT 行（三种载荷覆盖 {} / Normal / Bond）
   netlist_ok <host> [port]           0=有接口数据（PASS）
   netlist_summary <host> [port]      打印接口名与 IPv4
+  ct_uptime                          容器 uptime（整秒；失败空）
+  webui_workers / webui_http         界面 worker 计数 / HTTP 状态码（探针失败 -1 / 000）
+  webui_probe                        输出 "workers=<n> http=<code>"
 环境变量（可覆盖）：CTID CT_IP VM_IP VMID_CONTROL VMID_OTHER FNOS_USER FNOS_PASS
-                    FNOS_PORT HOST_BACKUP_ROOT CT_BACKUP_ROOT MANIFEST
+                    FNOS_PORT FNOS_WARMUP_SECONDS FNOS_PROBE_TIMEOUT
+                    HOST_BACKUP_ROOT CT_BACKUP_ROOT MANIFEST
 EOF
 }
 

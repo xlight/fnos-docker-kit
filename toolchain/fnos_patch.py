@@ -121,6 +121,9 @@ BUILD_INPUTS = (
     ("toolchain/aobpatch.py", lambda: os.path.join(TOOLCHAIN_DIR, "aobpatch.py")),
     ("toolchain/assets/libfnos-trashshim.so", lambda: TRASH_ASSET),
     ("toolchain/fnos-lib-consumers", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers")),
+    ("toolchain/fnos-lib-consumers-check", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers-check")),
+    ("toolchain/fnos-patch-repair", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-patch-repair")),
+    ("toolchain/fnos-update-grub-shim", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-update-grub-shim")),
     ("toolchain/fnos-nginx-route.sh", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-nginx-route.sh")),
     ("toolchain/fnos-patch-status", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-patch-status")),
     ("toolchain/fnos-patchset-fetch", lambda: os.path.join(TOOLCHAIN_DIR, "fnos-patchset-fetch")),
@@ -137,6 +140,9 @@ COPY_SOURCE_RESOLVERS = {
     'os.path.join(TOOLCHAIN_DIR, "aobpatch.py")': "toolchain/aobpatch.py",
     'os.path.join(TOOLCHAIN_DIR, "fnos-patchset-fetch")': "toolchain/fnos-patchset-fetch",
     'os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers")': "toolchain/fnos-lib-consumers",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers-check")': "toolchain/fnos-lib-consumers-check",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-patch-repair")': "toolchain/fnos-patch-repair",
+    'os.path.join(TOOLCHAIN_DIR, "fnos-update-grub-shim")': "toolchain/fnos-update-grub-shim",
     'os.path.join(TOOLCHAIN_DIR, "fnos-nginx-route.sh")': "toolchain/fnos-nginx-route.sh",
 }
 
@@ -598,6 +604,42 @@ RandomizedDelaySec=10min
 WantedBy=timers.target
 """
 
+# 补丁重放修复轮：独立短周期 timer + 包装脚本（锁 / 活动闸门 / 三态 / 预算）。
+# 与 6h 的 fnos-patch-status.timer 分工：后者只通知，前者负责自动修复。
+PATCH_REPAIR_UNIT = """[Unit]
+Description=fnOS patch replay repair (locked, budgeted, three-state)
+After=fnos-aob-www.service fnos-patch-status.service
+Wants=fnos-patchset-fetch.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fnos-patch-repair
+StandardOutput=journal
+StandardError=journal
+# 最坏路径 text 180s + wrapper apply 900s + 18 个消费者串行重启（每个 90s）≈ 45min；
+# 取 1h 而非 30min 是为了不砍断合法的慢轮次（砍断 = 半应用状态 + 白费一次预算）。
+TimeoutStartSec=3600
+# 0=healthy / 1=waiting / 2=failed —— 三种都是"结论"，不是单元故障
+SuccessExitStatus=0 1 2
+# 刻意不设 StartLimitBurst：systemd 超限后会连定时器触发的启动一起拒绝，
+# 把"业务退避"变成"循环锁死一小时"。退避只由包装脚本的预算承担。
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+PATCH_REPAIR_TIMER = """[Unit]
+Description=Periodic fnOS patch replay repair
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
+"""
+
 # 目标版本补丁集下载器（网络就绪后；失败返回 0 不阻塞开机）
 PATCHSET_FETCH_UNIT = """[Unit]
 Description=fnOS patchset fetch (download missing target-version patchset)
@@ -630,6 +672,32 @@ ExecStart=/usr/local/sbin/fnos-nginx-route.sh
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def validate_consumer_list(rootfs):
+    """构建期静态校验：清单存在、非空、每项是 unit 名、且镜像里真的有这个 unit。
+
+    构建期没有运行中的进程，所以这里**不**扫 /proc（那是运行期核对的事）。
+    """
+    rel = "usr/local/share/fnos-toolchain/lib-consumers.txt"
+    path = os.path.join(rootfs, rel)
+    errs = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return ["消费者清单缺失: %s" % rel]
+    units = [ln.split()[0] for ln in raw if not ln.startswith("#")]
+    if not units:
+        errs.append("消费者清单为空")
+    for u in units:
+        if not u.endswith(".service"):
+            errs.append("清单项不是 unit 名: %s" % u)
+            continue
+        if not any(os.path.exists(os.path.join(rootfs, d, u))
+                   for d in ("usr/lib/systemd/system", "etc/systemd/system")):
+            errs.append("清单中的 unit 在镜像里不存在: %s" % u)
+    return errs
 
 
 def write_file(path, content, mode=0o644):
@@ -859,6 +927,28 @@ def apply(rootfs, patches, mount_shim, enforce_version=True):
     # lib 消费者清单：live 替换 libnfile/libnperm/libtrimacl 后需重启这些服务（doc 35/36）
     shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers"),
                  os.path.join(rootfs, "usr/local/share/fnos-toolchain/lib-consumers.txt"))
+    cons_errs = validate_consumer_list(rootfs)
+    if cons_errs:
+        raise RuntimeError("消费者清单静态校验失败：" + "；".join(cons_errs))
+    log.append("consumer list validated（清单内 unit 在镜像中均存在）")
+    # 消费者清单运行期核对（needrestart 式）：完整性 + 生效性（stale inode）
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-lib-consumers-check"),
+                 os.path.join(rootfs, "usr/local/sbin/fnos-lib-consumers-check"))
+    os.chmod(os.path.join(rootfs, "usr/local/sbin/fnos-lib-consumers-check"), 0o755)
+    # 补丁重放修复轮（锁 / 活动闸门 / 三态 / 预算）；6h 的 patch-status 只做通知
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-patch-repair"),
+                 os.path.join(rootfs, "usr/local/sbin/fnos-patch-repair"))
+    os.chmod(os.path.join(rootfs, "usr/local/sbin/fnos-patch-repair"), 0o755)
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patch-repair.service"),
+               PATCH_REPAIR_UNIT)
+    enable_unit(rootfs, "fnos-patch-repair.service")
+    write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patch-repair.timer"),
+               PATCH_REPAIR_TIMER)
+    enable_unit(rootfs, "fnos-patch-repair.timer", "timers.target")
+    # update-grub 容器兼容 shim（OTA postupdate 最后一条命令；见 44/45 号文）
+    shutil.copy2(os.path.join(TOOLCHAIN_DIR, "fnos-update-grub-shim"),
+                 os.path.join(rootfs, "usr/local/sbin/update-grub"))
+    os.chmod(os.path.join(rootfs, "usr/local/sbin/update-grub"), 0o755)
     write_file(os.path.join(rootfs, "etc/systemd/system/fnos-patchset-fetch.service"),
                PATCHSET_FETCH_UNIT)
     enable_unit(rootfs, "fnos-patchset-fetch.service")
