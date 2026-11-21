@@ -1,6 +1,6 @@
 {
-  "revision": 23,
-  "generated": "2026-11-21T14:19:33Z",
+  "revision": 24,
+  "generated": "2026-11-21T17:59:28Z",
   "versions": {
     "1.2.1000": {
       "patchset": "fnos-1.2.1000.json",
@@ -9,7 +9,7 @@
       "total": 37,
       "status": "ready",
       "validated_at": "2026-11-08T05:57:54Z",
-      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
+      "source_commit": "3a9035a8a9636d90788d2fff025237f840d8b0c9"
     },
     "1.2.1010": {
       "patchset": "fnos-1.2.1010.json",
@@ -18,7 +18,7 @@
       "total": 37,
       "status": "ready",
       "validated_at": "2026-11-09T05:00:14Z",
-      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
+      "source_commit": "3a9035a8a9636d90788d2fff025237f840d8b0c9"
     },
     "1.2.1011": {
       "patchset": "fnos-1.2.1011.json",
@@ -27,7 +27,7 @@
       "total": 37,
       "status": "ready",
       "validated_at": null,
-      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
+      "source_commit": "3a9035a8a9636d90788d2fff025237f840d8b0c9"
     }
   },
   "samples": {
@@ -66,6 +66,24 @@
       },
       "generated": "2026-11-11T08:45:40Z",
       "asset": "v1.2.1010-r3/fingerprints-1.2.1010.json"
+    },
+    "1.2.1011": {
+      "source": "tier-A",
+      "state": "factory",
+      "files": {
+        "usr/trim/bin/filemanager": "9bddafa08199de6209b3bf0adc050f0a7ea1cf6e439e923453072274ee8d27a6",
+        "usr/trim/bin/liveupdate": "6c04753fd3d98b78b6711c406a9d31fce9376d5eb6a1b5d61106e5ea9fa19bf7",
+        "usr/trim/bin/network_service": "552e82e3103814e0b80923f6107c540b7265f58679b9da32cdc4a69e7f6bef05",
+        "usr/trim/bin/resmon_service": "ff0553b5566bd82e1c44ae9c1012a08f4ff1b6a5a2a85b87e33f76cdbbc2eb6e",
+        "usr/trim/bin/trim_app_center": "8c084c9b180b6078a941a8fcbeeea998b255ec7a36ab2a6905e6512035eeeb0e",
+        "usr/trim/lib/libnfile.so": "f48fa2059a94bb105a418cf519079e35c764546818c4b58050c9e1de582a5972",
+        "usr/trim/lib/libnperm.so": "4b36c1e9e718428b338815f5bc8606ebad004e6dfc496162de1d206e423b29e8",
+        "usr/trim/lib/libtrimacl.so": "e22e64442b32a9a3dd4e453897d516b9ac3b79c5e718b5b5aab4f2f2c23ee9d7",
+        "usr/trim/www/assets/Setting-CvdpPN7Y.js": "632c4b3142ea9c5fdfffa4aa76bc3a4b4d60e4a443fcb43ddfc9a5278c27a6ae",
+        "usr/trim/www/assets/index-D1auxRov.js": "e389859325213e39556d291ae1e7a5a79e18e92aab84c3aad53cb0b0ff43b9d6"
+      },
+      "generated": "2026-11-21T14:45:49Z",
+      "asset": "v1.2.1011/fingerprints-1.2.1011.json"
     }
   },
   "coverage": {
@@ -84,6 +102,14 @@
           "usr/trim/bin/liveupdate",
           "usr/trim/bin/resmon_service"
         ]
+      },
+      "1.2.1011": {
+        "covered_files": 7,
+        "total_files": 8,
+        "status": "partial",
+        "missing": [
+          "usr/trim/bin/resmon_service"
+        ]
       }
     },
     "1.2.1010": {
@@ -96,6 +122,12 @@
         ]
       },
       "1.2.1010": {
+        "covered_files": 8,
+        "total_files": 8,
+        "status": "ready",
+        "missing": []
+      },
+      "1.2.1011": {
         "covered_files": 8,
         "total_files": 8,
         "status": "ready",
@@ -118,6 +150,12 @@
         "missing": [
           "usr/trim/bin/liveupdate"
         ]
+      },
+      "1.2.1011": {
+        "covered_files": 8,
+        "total_files": 8,
+        "status": "ready",
+        "missing": []
       }
     }
   }
