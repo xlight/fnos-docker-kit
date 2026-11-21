@@ -340,6 +340,7 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          log() { printf '[publish] %s\n' "$*"; }
           ver="$VERSION"; tag="$TAG"
           # "Latest" 归属按 **fnOS 版本号**（不是发布时间）：GitHub 默认按日期选，
           # 补发一个更旧的版本会把 Latest 指向旧补丁集（2026-11-12 实测）。
