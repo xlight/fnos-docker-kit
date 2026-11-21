@@ -38,6 +38,7 @@ toolchain/tests/nic_test.sh
 toolchain/tests/envelope_test.sh
 toolchain/tests/patch-status.sh
 toolchain/tests/validate-index.py
+toolchain/tests/publish-image-dispatch-test.sh
 toolchain/tests/patch_status_test.py
 toolchain/tests/proxy-test.py
 toolchain/tests/release-guard-test.sh
