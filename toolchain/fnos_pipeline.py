@@ -217,6 +217,9 @@ def stage_patch(a):
     if all(st.values()) and not a.force:
         log("patch: rootfs 已打补丁，幂等跳过")
         return 0
+    if getattr(a, "pristine", None) and not os.path.isdir(a.pristine):
+        log("patch: 归档 pristine rootfs -> %s" % a.pristine)
+        subprocess.run(["cp", "-a", a.rootfs, a.pristine], check=True, timeout=7200)
     for line in fnos_patch.apply(a.rootfs, a.patchset, a.shim,
                                  enforce_version=not a.no_version_check):
         print("    " + line)
@@ -430,6 +433,8 @@ def main():
     ap.add_argument("cmd", choices=["run", "rollback", "status"])
     ap.add_argument("--rootfs", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--pristine", default=None,
+                    help="patch 阶段前把 rootfs 归档到这里（供 fnos-patch-reanchor）")
     ap.add_argument("--base", default=None,
                     help="deb-head 底座 rootfs 目录；给出则 run 自动先跑 overlay（ISO 路径不给）")
     ap.add_argument("--ota-version", default=None,

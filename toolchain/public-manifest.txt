@@ -102,6 +102,9 @@ toolchain/fnos_docker_compose.yml
 toolchain/README.public.md => README.md
 toolchain/docs/public-usage.md
 
+# 自动重锚（fnos-patchset-auto-reanchor）
+toolchain/fnos-patch-reanchor
+toolchain/tests/patch-reanchor-test.py
 
 [PRESERVE]
 # 不由私有真源产出、但必须留在公开仓里的路径（同步擦树时保留）。

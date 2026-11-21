@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+# ============================================================================
+# fnos-patch-reanchor —— 把上一版补丁集重新锚到新 build（**无表推导**）
+#
+# 背景：
+#   AOB 补丁的 `match` 是带 `??` 通配的十六进制（地址无关），跨版本通常仍然命中。
+#   新版本来了，不需要重建私有 shim 表，只要把上一版补丁集逐个 patch 在新 pristine
+#   rootfs 里重新匹配：
+#     n == expect  -> keep（match/replace 不变）
+#     n == 0       -> no-match（人工：函数变了）
+#     n != expect  -> expect-mismatch（人工）
+#   文本/www 补丁（kind=text，file 是 glob）原样带上；所有变体都命中才自动保留。
+#   retired/disabled 补丁原样保留、不做匹配、不计入 ready/total；
+#   带 anchor 的补丁按符号区间（readelf）计数，找不到符号 -> anchor-not-found。
+#
+# 用法：
+#   fnos-patch-reanchor --rootfs <dir> [--rootfs ...] --version <ver> \
+#                       --out <new.json> [--from <prev.json>] [--primary <variant>] \
+#                       [--no-validate] [--aobpatch <aobpatch.py>]
+#
+# 退出码：0 = 全部 keep/carried 且校验通过；1 = 有待人工项（stdout JSON 列 id）；
+#         2 = 输入/工具错误。
+# ============================================================================
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)  # 复用 aobpatch.symbol_range（readelf 求符号区间）
+PATCHES_DIR = os.environ.get("FNOS_PATCHES_DIR", os.path.join(HERE, "patches"))
+DEFAULT_AOBPATCH = os.path.join(HERE, "aobpatch.py")
+
+
+# ---------------------------------------------------------------------------
+# 基础工具
+# ---------------------------------------------------------------------------
+def vtuple(v):
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(v or ""))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def parse_match(hexstr):
+    """'?? ?? 29 c7' -> 正则 bytes；'?' -containing token 视为整字节通配。"""
+    s = str(hexstr).replace(" ", "")
+    toks = [s[i:i + 2] for i in range(0, len(s), 2)]
+    out = b""
+    for t in toks:
+        if "?" in t or t == "":
+            out += b"."
+        else:
+            out += re.escape(bytes.fromhex(t))
+    return re.compile(out, re.DOTALL)
+
+
+def count_matches(data, rx, lo=0, hi=None):
+    seg = data[lo:hi] if hi is not None else data[lo:]
+    return len(rx.findall(seg))
+
+
+def symbol_range(rootfs, rel, anchor):
+    try:
+        import aobpatch
+        return aobpatch.symbol_range(os.path.join(rootfs, rel), anchor)
+    except Exception:
+        return None
+
+
+def read_file(rootfs, rel):
+    with open(os.path.join(rootfs, rel), "rb") as f:
+        return f.read()
+
+
+def resolve_glob(rootfs, pattern):
+    return sorted(glob.glob(os.path.join(rootfs, pattern)))
+
+
+def load_patchset(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def select_from(target):
+    """目标版本之前最近的补丁集（按 fnos_version 排序）。"""
+    best, best_v = None, None
+    for p in sorted(glob.glob(os.path.join(PATCHES_DIR, "fnos-*.json"))):
+        try:
+            d = load_patchset(p)
+        except (OSError, ValueError):
+            continue
+        pt = vtuple(str(d.get("fnos_version", "")).lstrip("Vv"))
+        tt = vtuple(target)
+        if not pt:
+            continue
+        if tt and pt >= tt:
+            continue
+        if best_v is None or pt > best_v:
+            best, best_v = p, pt
+    return best, (str(load_patchset(best).get("fnos_version", "")) if best else None)
+
+
+# ---------------------------------------------------------------------------
+# 单个 patch 的分类
+# ---------------------------------------------------------------------------
+def classify_patch(patch, variants):
+    """返回 (keep: bool, reason: str, detail: dict)。"""
+    pid = patch.get("id", "?")
+    f = patch.get("file", "")
+    kind = patch.get("kind", "aob")
+
+    # retired/disabled：不参与应用，原样保留（与 1010 口径一致：validation 只算 active）
+    if patch.get("status") == "retired" or patch.get("disabled"):
+        return True, "carried-retired", {"file": f, "id": pid}
+
+    if kind == "text" or "match" not in patch:
+        # 文本/www：原样带上；只检查文件存在性
+        for v in variants:
+            files = resolve_glob(v["rootfs"], f)
+            if not files:
+                return False, "missing-file", {"file": f, "variant": v["name"]}
+        return True, "carried", {"file": f, "kind": "text"}
+
+    expect = int(patch.get("expect", 1))
+    rx = parse_match(patch["match"])
+    anchor = patch.get("anchor")
+    counts = {}
+    for v in variants:
+        try:
+            data = read_file(v["rootfs"], f)
+        except OSError:
+            return False, "missing-file", {"file": f, "variant": v["name"]}
+        if anchor:
+            rng = symbol_range(v["rootfs"], f, anchor)
+            if not rng:
+                return False, "anchor-not-found", {"file": f, "variant": v["name"],
+                                                   "anchor": anchor}
+            lo, hi = rng[0], (rng[1] if rng[1] else len(data))
+        else:
+            lo, hi = 0, len(data)
+        counts[v["name"]] = count_matches(data, rx, lo, hi)
+
+    if all(n == expect for n in counts.values()):
+        return True, "keep", {"counts": counts, "expect": expect}
+    if all(n == 0 for n in counts.values()):
+        return False, "no-match", {"counts": counts, "expect": expect}
+    if len(variants) > 1 and any(n == expect for n in counts.values()):
+        return False, "variant-mismatch", {"counts": counts, "expect": expect}
+    return False, "expect-mismatch", {"counts": counts, "expect": expect}
+
+
+# ---------------------------------------------------------------------------
+# 副本校验
+# ---------------------------------------------------------------------------
+def _parse_report(stdout):
+    try:
+        return json.loads(stdout)
+    except ValueError:
+        return None
+
+
+def _update_patched_hashes(out, rootfs):
+    """apply 之后把副本里的终态哈希写回 file_hashes[file].patched（主变体）。"""
+    try:
+        with open(out, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return
+    fh = d.get("file_hashes") or {}
+    changed = False
+    for f, v in list(fh.items()):
+        try:
+            if isinstance(v, dict):
+                v["patched"] = hashlib.sha256(read_file(rootfs, f)).hexdigest()
+                changed = True
+        except OSError:
+            pass
+    if changed:
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+def validate_copy(out, variant, aobpatch, timeout=1800, primary=False):
+    """在副本上 apply + check；返回 (ok, report, err)。"""
+    tmp = tempfile.mkdtemp(prefix="fnos-reanchor-")
+    try:
+        subprocess.run(["cp", "-a", variant["rootfs"] + "/.", tmp],
+                       check=True, capture_output=True, text=True, timeout=3600)
+        apply_cmd = [sys.executable, aobpatch, "apply", "--rootfs", tmp,
+                     "--patchset", out, "--best-effort"]
+        subprocess.run(apply_cmd, capture_output=True, text=True, timeout=timeout)
+        if primary:
+            _update_patched_hashes(out, tmp)
+        chk = subprocess.run([sys.executable, aobpatch, "check", "--rootfs", tmp,
+                              "--patchset", out, "--best-effort"],
+                             capture_output=True, text=True, timeout=timeout)
+        rep = _parse_report(chk.stdout)
+        if rep is None:
+            return False, None, "aobpatch check 输出非 JSON: %s" % (chk.stderr or chk.stdout)[:200]
+        return rep.get("ok", False), rep, None
+    except subprocess.TimeoutExpired:
+        return False, None, "aobpatch 超时"
+    except subprocess.CalledProcessError as e:
+        tail = (e.stderr or "")[-300:]
+        return False, None, "cp/apply 失败(rc=%s): %s" % (e.returncode, tail)
+    except OSError as e:
+        return False, None, str(e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _validate_ok(rep):
+    """AOB 不得有 failed/verify-failed；文本 skipped 是 warning。"""
+    bad = []
+    for p in rep.get("patches", []):
+        st = str(p.get("status", "")).split("(")[0]
+        if st in ("failed", "verify-failed"):
+            bad.append({"id": p.get("id"), "status": st})
+    return (not bad), bad
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rootfs", action="append", default=[], help="pristine rootfs（可多次）")
+    ap.add_argument("--version", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--from", dest="from_path", default=None)
+    ap.add_argument("--primary", default=None, help="主变体（默认最后一个 --rootfs）")
+    ap.add_argument("--no-validate", action="store_true")
+    ap.add_argument("--aobpatch", default=DEFAULT_AOBPATCH)
+    a = ap.parse_args()
+
+    if not a.rootfs:
+        print("缺少 --rootfs", file=sys.stderr)
+        return 2
+    if not os.path.exists(a.aobpatch) and not a.no_validate:
+        print("缺少 aobpatch: %s" % a.aobpatch, file=sys.stderr)
+        return 2
+
+    from_path, from_ver = (a.from_path, None)
+    if not from_path:
+        from_path, from_ver = select_from(a.version)
+    if not from_path or not os.path.exists(from_path):
+        print("找不到上一版补丁集（--from 或 %s）" % PATCHES_DIR, file=sys.stderr)
+        return 2
+    prev = load_patchset(from_path)
+    from_ver = from_ver or str(prev.get("fnos_version", "?"))
+
+    variants = []
+    for i, r in enumerate(a.rootfs):
+        if not os.path.isdir(r):
+            print("rootfs 不存在: %s" % r, file=sys.stderr)
+            return 2
+        variants.append({"name": os.path.basename(r.rstrip("/")) or "v%d" % i,
+                         "rootfs": os.path.abspath(r), "primary": False})
+    if a.primary:
+        hit = [v for v in variants if os.path.abspath(v["rootfs"]) == os.path.abspath(a.primary)
+               or v["name"] == a.primary]
+        if not hit:
+            print("--primary 不在 --rootfs 列表里: %s" % a.primary, file=sys.stderr)
+            return 2
+        hit[0]["primary"] = True
+    else:
+        variants[-1]["primary"] = True
+
+    kept, manual = [], []
+    for patch in prev.get("patches", []):
+        keep, reason, detail = classify_patch(patch, variants)
+        if keep:
+            kept.append(patch)
+        else:
+            manual.append({"id": patch.get("id"), "reason": reason,
+                           "file": patch.get("file", ""), "detail": detail})
+
+    # 只统计 active（retired/disabled 不参与，与 1010 validation 口径一致）
+    def _active(p):
+        return p.get("status") != "retired" and not p.get("disabled")
+
+    prev_active = [p for p in prev.get("patches", []) if _active(p)]
+    kept_active = [p for p in kept if _active(p)]
+
+    # file_hashes：主变体的 kept active AOB 文件（orig；patched 在副本校验后回填）
+    primary = next((v for v in variants if v["primary"]), variants[-1])
+    file_hashes = {}
+    for p in kept_active:
+        if p.get("kind", "aob") == "text":
+            continue
+        f = p.get("file", "")
+        if f in file_hashes:
+            continue
+        try:
+            file_hashes[f] = {"orig": hashlib.sha256(read_file(primary["rootfs"], f)).hexdigest()}
+        except OSError:
+            pass
+
+    aob_total = len([p for p in prev_active if p.get("kind", "aob") != "text"])
+    aob_ready = len([p for p in kept_active if p.get("kind", "aob") != "text"])
+    out = {
+        "fnos_version": a.version,
+        "derived_from_table": "reanchor:%s" % from_ver,
+        "file_hashes": file_hashes,
+        "patches": kept,
+        "validation": {
+            "ready": len(kept_active),
+            "total": len(prev_active),
+            "aob_ready": aob_ready,
+            "aob_total": aob_total,
+            "variants": {v["name"]: {"ready": len(kept_active), "total": len(prev_active)}
+                         for v in variants},
+            "manual": manual,
+            "validated_at": None,
+        },
+    }
+    existed = os.path.exists(a.out)
+    if existed:
+        out["validation"]["regenerated"] = True
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with open(a.out, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    # 副本校验（每个变体）
+    verify_failed = []
+    warnings = []
+    if not a.no_validate:
+        for v in variants:
+            ok, rep, err = validate_copy(a.out, v, a.aobpatch, primary=(v is primary))
+            if rep is None:
+                verify_failed.append({"variant": v["name"], "reason": err or "no report"})
+                continue
+            bad = [p for p in rep.get("patches", [])
+                   if str(p.get("status", "")).split("(")[0] in ("failed", "verify-failed")]
+            if bad:
+                verify_failed.append({"variant": v["name"],
+                                      "patches": [{"id": p.get("id"), "status": p.get("status")} for p in bad]})
+            for p in rep.get("patches", []):
+                if str(p.get("status", "")).split("(")[0] == "skipped":
+                    warnings.append({"variant": v["name"], "id": p.get("id"),
+                                     "reason": p.get("reason", "")})
+        out["validation"]["warnings"] = warnings
+        out["validation"]["verify_failed"] = verify_failed
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+
+    ok = (not manual) and (not verify_failed) and len(kept_active) == len(prev_active)
+    print(json.dumps({"ok": ok, "version": a.version, "from": from_ver, "out": a.out,
+                      "ready": len(kept_active), "total": len(prev_active),
+                      "manual": manual, "verify_failed": verify_failed,
+                      "variants": out["validation"]["variants"],
+                      "warnings": warnings}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
