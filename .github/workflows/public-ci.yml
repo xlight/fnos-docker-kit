@@ -38,9 +38,19 @@ on:
         required: false
         default: false
         type: boolean
+  # 发布单元（public-release）发布补丁集后经 repository_dispatch 通知构建（GITHUB_TOKEN
+  # 例外事件；release: published 不可用——GITHUB_TOKEN 创建的 release 不产生 run）。
+  # payload：client_payload.version / client_payload.channel。
+  repository_dispatch:
+    types: [build-image]
 
 env:
   DOCKERHUB_REPO: "xlight/fnos-dockermode"
+
+# 同 (版本, 通道) 串行化（队列语义）：A/B/手工重复触发不并行推同一 tag；Hub 去重兜底。
+concurrency:
+  group: image-${{ inputs.version || github.event.client_payload.version }}-${{ inputs.channel || github.event.client_payload.channel || 'iso' }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -94,16 +104,22 @@ jobs:
         run: |
           set -o pipefail
           channel="${{ inputs.channel }}"
+          [ -n "$channel" ] || channel="${{ github.event.client_payload.channel }}"
           [ "$channel" = "deb" ] || channel="iso"
           version="${{ inputs.version }}"
+          [ -n "$version" ] || version="${{ github.event.client_payload.version }}"
+          out=""
           if [ -z "$version" ]; then
             out=$(python3 toolchain/check-iso-update.py --signed --no-ota 2>/dev/null) || {
-              echo "检测器失败，无法确定版本（请显式传 version）"; exit 1; }
+              echo "检测器失败，无法确定版本（请显式传 version 或 client_payload.version）"; exit 1; }
             version=$(echo "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin)["current"]["version"])')
-            if [ -z "${{ inputs.iso_url }}" ]; then
-              url=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("signed_url") or "")')
-              echo "ISO_URL=$url" >> "$GITHUB_ENV"
-            fi
+          fi
+          # ISO 签名 URL：只要 iso 通道且未显式给 iso_url 就现取（不依赖 version 来源；
+          # 否则 repository_dispatch / 带 version 无 iso_url 会在下载步骤报"无 ISO 下载地址"）。
+          if [ "$channel" = "iso" ] && [ -z "${{ inputs.iso_url }}" ]; then
+            [ -n "$out" ] || out=$(python3 toolchain/check-iso-update.py --signed --no-ota 2>/dev/null || echo "")
+            url=$(echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("signed_url") or "")' 2>/dev/null || echo "")
+            [ -n "$url" ] && echo "ISO_URL=$url" >> "$GITHUB_ENV"
           fi
           if [ "$channel" = "iso" ]; then tag="$version"; else tag="$version-ota"; fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -154,7 +170,7 @@ jobs:
       # ---- iso 通道：现签下载 + hash 校验 + extract ----
       - name: 恢复 ISO 缓存（按版本 key；命中则跳过下载）
         id: iso-cache
-        if: env.CHANNEL == 'iso' && inputs.version != ''
+        if: env.CHANNEL == 'iso' && steps.plan.outputs.version != ''
         uses: actions/cache/restore@v4
         with:
           path: /tmp/fnos.iso

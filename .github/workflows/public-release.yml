@@ -359,6 +359,26 @@ jobs:
           gh release upload "$tag" "${assets[@]}" --clobber
           echo "已发布: $tag"
 
+      - name: 通知构建单元（repository_dispatch；GITHUB_TOKEN 例外事件）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${{ vars.FNOS_AUTO_BUILD_DISABLE }}" = "true" ]; then
+            echo "FNOS_AUTO_BUILD_DISABLE=true → 跳过自动构建通知"
+            exit 0
+          fi
+          ver="$VERSION"
+          if gh api -X POST "repos/${{ github.repository }}/dispatches" \
+              -f event_type=build-image \
+              -f "client_payload[version]=$ver" \
+              -f 'client_payload[channel]=iso'; then
+            echo "已通知构建单元：version=$ver channel=iso"
+          else
+            echo "::warning::repository_dispatch 失败（发布不回滚；watch 次日兜底或 gh api 手工补发）"
+          fi
+
       - name: 归档发布产物
         if: always()
         uses: actions/upload-artifact@v4
