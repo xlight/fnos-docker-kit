@@ -1,6 +1,6 @@
 {
-  "revision": 22,
-  "generated": "2026-11-12T04:41:32Z",
+  "revision": 23,
+  "generated": "2026-11-21T14:19:33Z",
   "versions": {
     "1.2.1000": {
       "patchset": "fnos-1.2.1000.json",
@@ -9,7 +9,7 @@
       "total": 37,
       "status": "ready",
       "validated_at": "2026-11-08T05:57:54Z",
-      "source_commit": "f6f13747c5c8cd9d3169998226ee67d6cd73386d"
+      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
     },
     "1.2.1010": {
       "patchset": "fnos-1.2.1010.json",
@@ -18,7 +18,16 @@
       "total": 37,
       "status": "ready",
       "validated_at": "2026-11-09T05:00:14Z",
-      "source_commit": "f6f13747c5c8cd9d3169998226ee67d6cd73386d"
+      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
+    },
+    "1.2.1011": {
+      "patchset": "fnos-1.2.1011.json",
+      "sha256": "77d0adaceb29b77253b069b98fc210ec41b737df9a851d592c1a5cfc537cd3b8",
+      "ready": 37,
+      "total": 37,
+      "status": "ready",
+      "validated_at": null,
+      "source_commit": "f57f0bc2c69d61fa6cdc9a936e417617eb2f883b"
     }
   },
   "samples": {
@@ -91,6 +100,24 @@
         "total_files": 8,
         "status": "ready",
         "missing": []
+      }
+    },
+    "1.2.1011": {
+      "1.2.1000": {
+        "covered_files": 7,
+        "total_files": 8,
+        "status": "partial",
+        "missing": [
+          "usr/trim/bin/resmon_service"
+        ]
+      },
+      "1.2.1010": {
+        "covered_files": 7,
+        "total_files": 8,
+        "status": "partial",
+        "missing": [
+          "usr/trim/bin/liveupdate"
+        ]
       }
     }
   }
