@@ -344,6 +344,12 @@ def main():
                 if str(p.get("status", "")).split("(")[0] == "skipped":
                     warnings.append({"variant": v["name"], "id": p.get("id"),
                                      "reason": p.get("reason", "")})
+        try:  # 取回副本校验回填的 patched 哈希（_update_patched_hashes 写的是文件，
+            # 内存里的 out 仍是 orig-only，直接回写会把 patched 覆盖掉）
+            with open(a.out, encoding="utf-8") as f:
+                out = json.load(f)
+        except (OSError, ValueError):
+            pass
         out["validation"]["warnings"] = warnings
         out["validation"]["verify_failed"] = verify_failed
         with open(a.out, "w", encoding="utf-8") as f:

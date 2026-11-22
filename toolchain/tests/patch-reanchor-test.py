@@ -151,10 +151,13 @@ else:
                         "--from", prev_ok, "--aobpatch", fake],
                        capture_output=True, text=True)
     doc = json.loads(r.stdout)
-    if r.returncode == 0 and doc.get("ok"):
-        ok("⑤ 副本校验通过 → ok")
+    out5 = json.load(open(out))
+    fh5 = out5.get("file_hashes") or {}
+    filled = all(isinstance(v, dict) and v.get("patched") for v in fh5.values()) if fh5 else False
+    if r.returncode == 0 and doc.get("ok") and filled:
+        ok("⑤ 副本校验通过 → ok；file_hashes 已回填 patched")
     else:
-        bad("⑤ 校验通过用例不符: rc=%s %s" % (r.returncode, doc))
+        bad("⑤ 校验通过用例不符: rc=%s %s filled=%s" % (r.returncode, doc, filled))
 
     # ⑥ 校验失败 → rc=1
     write(os.path.join(root, ".fail"), "")

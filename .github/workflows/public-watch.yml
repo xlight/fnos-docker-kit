@@ -25,7 +25,6 @@ jobs:
     permissions:
       contents: write   # 提交 state/（Actions cache 不可更新，不能当状态载体）
       issues: write     # 维护版本状态 Issue
-      actions: write    # 自动构建评估 dispatch public-ci（workflow_dispatch）
     steps:
       - uses: actions/checkout@v4
 
@@ -68,46 +67,6 @@ jobs:
             --index toolchain/patches/index.json \
             --repo "${{ github.repository }}" \
             --hub-repo "${DOCKERHUB_REPO}"
-
-      - name: 自动构建评估（补丁集 ready + Hub 无 tag + rc≠2 → dispatch public-ci）
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DETECT_RC: ${{ steps.detect.outputs.rc }}
-        run: |
-          set -euo pipefail
-          if [ "${{ vars.FNOS_AUTO_BUILD_DISABLE }}" = "true" ]; then
-            echo "FNOS_AUTO_BUILD_DISABLE=true → 跳过自动构建"
-            exit 0
-          fi
-          ver=$(python3 -c 'import json; print(json.load(open("/tmp/detect.json"))["current"]["version"])')
-          [ -n "$ver" ] || { echo "无当前版本，跳过"; exit 0; }
-          # ① 补丁集就绪（index status=ready，即 ready==total）
-          ready=$(python3 -c 'import json; d=json.load(open("toolchain/patches/index.json")); e=d["versions"].get("'$ver'"); print(1 if e and e.get("status")=="ready" else 0)')
-          if [ "$ready" != "1" ]; then
-            echo "补丁集未就绪（$ver）→ 保持待 rebase/可构建 Issue，不构建"
-            exit 0
-          fi
-          # ② Hub tag 不存在（非 200/404 → 保守跳过）
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "https://hub.docker.com/v2/repositories/xlight/fnos-dockermode/tags/$ver")
-          if [ "$code" = "200" ]; then
-            echo "Hub 已有 $ver → 跳过（幂等）"
-            exit 0
-          fi
-          if [ "$code" != "404" ]; then
-            echo "::warning::Hub 查询失败（http=$code）→ 保守跳过自动构建"
-            exit 0
-          fi
-          # ③ 检测器 rc=2（任一通道失败）→ 跳过
-          if [ "$DETECT_RC" = "2" ]; then
-            echo "::warning::检测器有通道失败（rc=2）→ 跳过自动构建"
-            exit 0
-          fi
-          # ④ dispatch（workflow_dispatch 是 GITHUB_TOKEN 例外事件）
-          if gh workflow run public-ci.yml -f version="$ver" -f channel=iso; then
-            echo "已 dispatch 构建：version=$ver channel=iso"
-          else
-            echo "::warning::dispatch 失败（次日重试）"
-          fi
 
       - name: 归档检测产物（便于排查）
         if: always()

@@ -18,6 +18,7 @@
 #
 # 选项：
 #   --version <ver>   目标 fnOS 版本（缺省 = 检测器当前版本）
+#   --rootfs <dir>    跳过 ISO 下载/解包，直接用现成 pristine rootfs（如 OTA deb overlay 产物）
 #   --iso <path>      本地 ISO（缺省 = 用检测器给的签名 URL 现下）
 #   --workdir <dir>   工作目录（缺省 /tmp/fnos-rehearse）
 #   --keep            保留解出的 rootfs（默认删）
@@ -39,10 +40,12 @@ FS=ext4
 log()  { printf '[rehearse] %s\n' "$*"; }
 die()  { printf '[rehearse] FATAL: %s\n' "$*" >&2; exit "${2:-2}"; }
 
+ROOTFS_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="${2:-}"; shift 2;;
     --iso)     ISO="${2:-}"; shift 2;;
+    --rootfs)  ROOTFS_ARG="${2:-}"; shift 2;;
     --workdir) WORKDIR="${2:-}"; shift 2;;
     --size)    SIZE="${2:-}"; shift 2;;
     --fs)      FS="${2:-}"; shift 2;;
@@ -118,9 +121,12 @@ log "可用磁盘: ${avail_g}G（需要 ≥25G）"
 
 mkdir -p "$WORKDIR"
 
-# ---------- 1. 解析 ISO 来源 ----------
+# ---------- 1. 解析 ISO 来源（--rootfs 时跳过） ----------
 DETECT_JSON=""
-if [ -z "$ISO" ]; then
+if [ -n "$ROOTFS_ARG" ]; then
+  [ -n "$VERSION" ] || die "--rootfs 模式必须显式给 --version"
+  log "使用现成 pristine rootfs（跳过 ISO 解析/下载/解包）: $ROOTFS_ARG"
+elif [ -z "$ISO" ]; then
   log "经 check-iso-update.py --signed 取签名 URL（官方裸 URL 返回 403）"
   DETECT_JSON="$(python3 "$SCRIPT_DIR/check-iso-update.py" --signed --no-ota 2>/dev/null)"
   rc=$?
@@ -150,10 +156,12 @@ else
 fi
 
 # ---------- 2. md5 校验（不接受未校验的 ISO） ----------
+if [ -z "$ROOTFS_ARG" ]; then
 got_md5="$(md5sum "$ISO" | awk '{print $1}')"
 log "ISO md5: $got_md5（官方: ${ISO_MD5:-未知}）"
 if [ -n "$ISO_MD5" ] && [ "$got_md5" != "$ISO_MD5" ]; then
   fail "verify" "ISO md5 不符：want=${ISO_MD5} got=${got_md5}"
+fi
 fi
 
 # ---------- 3. 补丁集 ----------
@@ -163,14 +171,19 @@ PATCHSET="$SCRIPT_DIR/patches/fnos-${VERSION#V}.json"
 PATCHSET_SHA="$(sha256sum "$PATCHSET" | awk '{print $1}')"
 log "补丁集: $(basename "$PATCHSET") sha256=$PATCHSET_SHA"
 
-# ---------- 4. extract ----------
-ROOTFS="$WORKDIR/rootfs-${VERSION#V}"
-rm -rf "$ROOTFS"; mkdir -p "$ROOTFS"
-log "extract 出厂 rootfs -> $ROOTFS"
-t0=$(now)
-python3 "$SCRIPT_DIR/fnos_iso.py" extract "$ISO" "$ROOTFS" >/dev/null 2>&1 \
-  || fail "extract" "fnos_iso.py extract 失败"
-T_EXTRACT=$(( $(now) - t0 ))
+# ---------- 4. extract（--rootfs 时跳过，直接用现成 pristine rootfs） ----------
+if [ -n "$ROOTFS_ARG" ]; then
+  ROOTFS="$ROOTFS_ARG"
+  log "使用现成 rootfs: $ROOTFS"
+else
+  ROOTFS="$WORKDIR/rootfs-${VERSION#V}"
+  rm -rf "$ROOTFS"; mkdir -p "$ROOTFS"
+  log "extract 出厂 rootfs -> $ROOTFS"
+  t0=$(now)
+  python3 "$SCRIPT_DIR/fnos_iso.py" extract "$ISO" "$ROOTFS" >/dev/null 2>&1 \
+    || fail "extract" "fnos_iso.py extract 失败"
+  T_EXTRACT=$(( $(now) - t0 ))
+fi
 
 # ---------- 5. apply ----------
 log "apply 补丁集"
